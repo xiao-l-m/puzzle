@@ -29,6 +29,13 @@ class FirmwareProtocolContractTests(unittest.TestCase):
         self.assertIn("MISSING_ITEM", self.controller)
         self.assertIn('"ERR %lu RANGE"', self.controller)
 
+    def test_carried_xy_and_rotation_are_concurrent_and_share_deadline(self) -> None:
+        self.assertIn("start_place_xy_and_rotation", self.controller)
+        self.assertIn('send_state("MOVE_PLACE_ROTATE")', self.controller)
+        self.assertIn("rotationDeadline", self.controller)
+        self.assertIn("xyDeadline", self.controller)
+        self.assertIn("STATE_WAIT_PLACE_XY_ROTATE", self.controller)
+
 
 if __name__ == "__main__":
     unittest.main()

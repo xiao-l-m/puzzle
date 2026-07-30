@@ -40,6 +40,11 @@ class StageCalibration:
     z_pick_drop_mm: float = 8.0
     rotation_sign: float = 1.0
     vision_boundary_tolerance_mm: float = 1.0
+    # Fine correction from ideal visual placement to the real magnet centre.
+    # Keep these at zero until a consistent signed X/Y placement error has
+    # been measured on the fixed camera/gantry installation.
+    mode3_place_offset_x_mm: float = 0.0
+    mode3_place_offset_y_mm: float = 0.0
 
     def point_is_reachable(self, point: Iterable[float]) -> bool:
         x, y = (float(value) for value in point)
@@ -1424,14 +1429,21 @@ def build_arbitrary_motion_plan(
     unreachable: list[dict[str, Any]] = []
     for source_move in source_moves:
         piece_id = str(source_move.get("piece_id", "?"))
-        pick = calibration.clamp_visual_boundary_noise(
-            source_move["pick_a4_mm"]
+        pick = [float(value) for value in source_move["pick_a4_mm"]]
+        place = [float(value) for value in source_move["place_a4_mm"]]
+        pick_controller = calibration.clamp_visual_boundary_noise(pick)
+        place_controller = calibration.clamp_visual_boundary_noise(
+            [
+                place[0] + calibration.mode3_place_offset_x_mm,
+                place[1] + calibration.mode3_place_offset_y_mm,
+            ]
         )
-        place = calibration.clamp_visual_boundary_noise(
-            source_move["place_a4_mm"]
+        source_problem = _check_point(
+            calibration, pick_controller, piece_id, "PICK"
         )
-        source_problem = _check_point(calibration, pick, piece_id, "PICK")
-        target_problem = _check_point(calibration, place, piece_id, "PLACE")
+        target_problem = _check_point(
+            calibration, place_controller, piece_id, "PLACE"
+        )
         if source_problem is not None:
             unreachable.append(source_problem)
         if target_problem is not None:
@@ -1445,8 +1457,14 @@ def build_arbitrary_motion_plan(
                 "target_piece": "ARBITRARY_RECTANGLE",
                 "pick_a4_mm": [round(float(value), 2) for value in pick],
                 "place_a4_mm": [round(float(value), 2) for value in place],
-                "pick_stage_mm": calibration.a4_to_stage_mm(pick),
-                "place_stage_mm": calibration.a4_to_stage_mm(place),
+                "pick_controller_a4_mm": [
+                    round(float(value), 2) for value in pick_controller
+                ],
+                "place_controller_a4_mm": [
+                    round(float(value), 2) for value in place_controller
+                ],
+                "pick_stage_mm": calibration.a4_to_stage_mm(pick_controller),
+                "place_stage_mm": calibration.a4_to_stage_mm(place_controller),
                 "rotate_deg_clockwise": round(rotation, 2),
                 "motor5_rotate_deg": round(
                     calibration.rotation_sign * rotation, 2
@@ -1464,8 +1482,13 @@ def build_arbitrary_motion_plan(
         "ready": not unreachable and len(moves) == expected_count,
         "error": None if not unreachable else "STAGE_POINT_UNREACHABLE",
         "piece_count": expected_count,
-        "source_region": "upper",
-        "target_region": "lower",
+        "source_region": "lower",
+        "target_region": "upper",
+        "mode3_coordinate_transform": "CONTROLLER_Y=VISUAL_Y",
+        "mode3_place_offset_mm": [
+            calibration.mode3_place_offset_x_mm,
+            calibration.mode3_place_offset_y_mm,
+        ],
         "target_rectangle_mm": source.get("target_rectangle_mm"),
         "solver": source.get("solver"),
         "solver_score": source.get("score"),
@@ -1574,19 +1597,24 @@ def estimate_plan_seconds(
     current = [calibration.home_x_a4_mm, calibration.home_y_a4_mm]
     total = 0.0
     for move in plan["moves"]:
-        pick = move["pick_a4_mm"]
-        place = move["place_a4_mm"]
+        pick = move.get("pick_controller_a4_mm", move["pick_a4_mm"])
+        place = move.get("place_controller_a4_mm", move["place_a4_mm"])
         total += _xy_profile_duration_seconds(current, pick)
         total += pick_or_place_seconds
         rotation = abs(float(move.get("motor5_rotate_deg", 0.0)))
+        travel_seconds = _xy_profile_duration_seconds(pick, place)
         if rotation > 0.0:
             rotation_seconds = _profile_duration_seconds(
                 distance_revolutions=rotation / 360.0,
                 speed_rpm=120.0,
                 acceleration_level=5,
             )
-            total += 2.0 * rotation_seconds
-        total += _xy_profile_duration_seconds(pick, place)
+            # The forward rotation now runs concurrently with the carried XY
+            # move.  Rotation-to-zero after release is still a separate move.
+            total += max(rotation_seconds, travel_seconds)
+            total += rotation_seconds
+        else:
+            total += travel_seconds
         total += pick_or_place_seconds
         current = list(place)
     total += _xy_profile_duration_seconds(

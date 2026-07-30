@@ -34,10 +34,8 @@ typedef enum {
     STATE_WAIT_MAGNET_PICK,
     STATE_COMMAND_PICK_UP,
     STATE_WAIT_PICK_UP,
-    STATE_COMMAND_ROTATE,
-    STATE_WAIT_ROTATE,
-    STATE_COMMAND_PLACE_XY,
-    STATE_WAIT_PLACE_XY,
+    STATE_COMMAND_PLACE_XY_ROTATE,
+    STATE_WAIT_PLACE_XY_ROTATE,
     STATE_COMMAND_PLACE_DOWN,
     STATE_WAIT_PLACE_DOWN,
     STATE_WAIT_MAGNET_RELEASE,
@@ -227,10 +225,8 @@ static const char *state_name(ControllerState state)
         case STATE_WAIT_MAGNET_PICK: return "MAGNET_PICK";
         case STATE_COMMAND_PICK_UP:
         case STATE_WAIT_PICK_UP: return "Z_UP_PICK";
-        case STATE_COMMAND_ROTATE:
-        case STATE_WAIT_ROTATE: return "ROTATE";
-        case STATE_COMMAND_PLACE_XY:
-        case STATE_WAIT_PLACE_XY: return "MOVE_PLACE";
+        case STATE_COMMAND_PLACE_XY_ROTATE:
+        case STATE_WAIT_PLACE_XY_ROTATE: return "MOVE_PLACE_ROTATE";
         case STATE_COMMAND_PLACE_DOWN:
         case STATE_WAIT_PLACE_DOWN: return "Z_DOWN_PLACE";
         case STATE_WAIT_MAGNET_RELEASE: return "MAGNET_RELEASE";
@@ -428,6 +424,47 @@ static MotionStart start_rotation(int32_t relativeAngleMdeg, uint32_t nowMs)
     return MOTION_STARTED;
 }
 
+static MotionStart start_place_xy_and_rotation(const GantryJob *job,
+                                               uint32_t nowMs)
+{
+    MotionStart rotationResult;
+    MotionStart xyResult;
+    uint32_t rotationDeadline = nowMs;
+    uint32_t xyDeadline = nowMs;
+
+    if (job == NULL) {
+        return MOTION_FAILED;
+    }
+
+    /* Motor 5 is addressed independently, so start it first and then launch
+     * the synchronized X/Y group.  Both motions run concurrently. */
+    rotationResult = start_rotation(job->angleMdeg, nowMs);
+    if (rotationResult == MOTION_FAILED) {
+        return MOTION_FAILED;
+    }
+    if (rotationResult == MOTION_STARTED) {
+        rotationDeadline = g_controller.deadlineMs;
+    }
+
+    xyResult = start_xy_move(job->targetX10, job->targetY10, nowMs);
+    if (xyResult == MOTION_FAILED) {
+        return MOTION_FAILED;
+    }
+    if (xyResult == MOTION_STARTED) {
+        xyDeadline = g_controller.deadlineMs;
+    }
+
+    /* Z may descend only after the slower of XY and rotation has completed. */
+    g_controller.deadlineMs =
+        ((int32_t)(rotationDeadline - xyDeadline) > 0)
+            ? rotationDeadline : xyDeadline;
+    if ((rotationResult == MOTION_STARTED) ||
+        (xyResult == MOTION_STARTED)) {
+        return MOTION_STARTED;
+    }
+    return MOTION_SKIPPED;
+}
+
 static bool parse_u32(const char *text, uint32_t *value)
 {
     char *end;
@@ -531,7 +568,7 @@ void GantryController_Init(uint32_t nowMs)
     MOS_Switch_Off();
 
     (void)RpiLink_SendFormat(
-        "READY GANTRY_V2 HOME %ld %ld RANGE %ld %ld %ld %ld",
+        "READY GANTRY_V3_XY_ROTATE HOME %ld %ld RANGE %ld %ld %ld %ld",
         (long)GANTRY_HOME_X_X10, (long)GANTRY_HOME_Y_X10,
         (long)GANTRY_MIN_X_X10, (long)GANTRY_MAX_X_X10,
         (long)GANTRY_MIN_Y_X10, (long)GANTRY_MAX_Y_X10);
@@ -1025,49 +1062,31 @@ void GantryController_Update(uint32_t nowMs)
         case STATE_WAIT_PICK_UP:
             if (deadline_reached(nowMs)) {
                 g_controller.zSafe = true;
-                g_controller.state = STATE_COMMAND_ROTATE;
+                g_controller.state = STATE_COMMAND_PLACE_XY_ROTATE;
             }
             break;
 
-        case STATE_COMMAND_ROTATE:
+        case STATE_COMMAND_PLACE_XY_ROTATE:
             job = &g_controller.jobs[g_controller.jobIndex];
-            send_state("ROTATE");
-            result = start_rotation(job->angleMdeg, nowMs);
+            send_state("MOVE_PLACE_ROTATE");
+            result = start_place_xy_and_rotation(job, nowMs);
             if (result == MOTION_FAILED) {
-                enter_fault("ROTATE_TX");
+                enter_fault("MOVE_PLACE_ROTATE_TX");
             } else if (result == MOTION_SKIPPED) {
-                g_controller.state = STATE_COMMAND_PLACE_XY;
-            } else {
-                g_controller.state = STATE_WAIT_ROTATE;
-            }
-            break;
-
-        case STATE_WAIT_ROTATE:
-            if (deadline_reached(nowMs)) {
+                g_controller.currentX10 = g_controller.pendingX10;
+                g_controller.currentY10 = g_controller.pendingY10;
                 g_controller.rotationMdeg = g_controller.pendingRotationMdeg;
-                g_controller.state = STATE_COMMAND_PLACE_XY;
-            }
-            break;
-
-        case STATE_COMMAND_PLACE_XY:
-            job = &g_controller.jobs[g_controller.jobIndex];
-            send_state("MOVE_PLACE");
-            result = start_xy_move(job->targetX10, job->targetY10, nowMs);
-            if (result == MOTION_FAILED) {
-                enter_fault("MOVE_PLACE_TX");
-            } else if (result == MOTION_SKIPPED) {
-                g_controller.currentX10 = job->targetX10;
-                g_controller.currentY10 = job->targetY10;
                 g_controller.state = STATE_COMMAND_PLACE_DOWN;
             } else {
-                g_controller.state = STATE_WAIT_PLACE_XY;
+                g_controller.state = STATE_WAIT_PLACE_XY_ROTATE;
             }
             break;
 
-        case STATE_WAIT_PLACE_XY:
+        case STATE_WAIT_PLACE_XY_ROTATE:
             if (deadline_reached(nowMs)) {
                 g_controller.currentX10 = g_controller.pendingX10;
                 g_controller.currentY10 = g_controller.pendingY10;
+                g_controller.rotationMdeg = g_controller.pendingRotationMdeg;
                 g_controller.state = STATE_COMMAND_PLACE_DOWN;
             }
             break;

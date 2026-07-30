@@ -495,8 +495,10 @@ class GantryTaskController:
 
     @staticmethod
     def _item_line(request_id: int, index: int, move: dict[str, Any]) -> str:
-        pick = move["pick_a4_mm"]
-        place = move["place_a4_mm"]
+        # Keep ideal visual points for the overlay while preferring explicit
+        # MCU-frame points when fine magnet placement compensation is present.
+        pick = move.get("pick_controller_a4_mm", move["pick_a4_mm"])
+        place = move.get("place_controller_a4_mm", move["place_a4_mm"])
         angle = float(move.get("motor5_rotate_deg", 0.0))
         return (
             f"ITEM {request_id} {index} "
