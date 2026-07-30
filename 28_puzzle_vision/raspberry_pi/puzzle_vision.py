@@ -255,6 +255,11 @@ class PuzzleDetector:
         )
         self.arbitrary_solution_cache: dict[str, Any] | None = None
         self.arbitrary_solution_reference: dict[str, Any] | None = None
+        # Modes 2 and 3 use different source shapes and target solvers.  Keep
+        # their annotated frames separate so the browser never overlays a
+        # fixed Figure-2 plan on an arbitrary-white-piece reconstruction.
+        self.mode2_preview: np.ndarray | None = None
+        self.mode3_preview: np.ndarray | None = None
 
     def stabilize_a4_corners(
         self, corners: np.ndarray
@@ -1718,6 +1723,8 @@ class PuzzleDetector:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2,
             )
             blank = np.full((WARP_HEIGHT, WARP_WIDTH, 3), 245, np.uint8)
+            self.mode2_preview = blank.copy()
+            self.mode3_preview = blank.copy()
             return (
                 {
                     "a4_found": False,
@@ -1966,6 +1973,9 @@ class PuzzleDetector:
                 and is_stable
                 and assembly_plan.get("measurement_stable", False)
             )
+        # This base contains only the rectified A4 and divider annotations.
+        # Each feature draws on its own copy below.
+        preview_base = annotated.copy()
         for piece, contour in zip(pieces, contours):
             cv2.drawContours(annotated, [contour], -1, (0, 255, 0), 3)
             center = tuple(
@@ -2048,6 +2058,22 @@ class PuzzleDetector:
                     color,
                     2,
                 )
+        mode2_state_color = (0, 170, 0) if is_stable else (0, 140, 255)
+        cv2.putText(
+            annotated,
+            f"MODE2 PIECES={len(pieces)} STABLE={int(is_stable)}",
+            (12, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            mode2_state_color,
+            2,
+        )
+        self.mode2_preview = annotated.copy()
+
+        # Start mode 3 again from the clean A4 base.  Its yellow threshold
+        # contours and magenta fitted polygons now cannot be confused with
+        # the green fixed-template contours used by mode 2.
+        annotated = preview_base.copy()
         for piece, contour in zip(arbitrary_pieces, arbitrary_contours):
             cv2.drawContours(annotated, [contour], -1, (0, 255, 255), 3)
             fitted_polygon = np.rint(
@@ -2144,12 +2170,6 @@ class PuzzleDetector:
                     color,
                     2,
                 )
-        state_color = (0, 170, 0) if is_stable else (0, 140, 255)
-        cv2.putText(
-            annotated,
-            f"PIECES={len(pieces)} STABLE={int(is_stable)}",
-            (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, state_color, 2,
-        )
         arbitrary_state_color = (
             (0, 190, 0)
             if arbitrary_stability["stable"]
@@ -2157,10 +2177,10 @@ class PuzzleDetector:
         )
         cv2.putText(
             annotated,
-            f"Q2_WHITE={len(arbitrary_pieces)} "
+            f"MODE3 WHITE={len(arbitrary_pieces)} "
             f"STABLE={int(arbitrary_stability['stable'])} "
             f"SOLVED={int(bool(arbitrary_plan.get('geometry_ready', False) or arbitrary_plan.get('ready', False)))}",
-            (12, 58),
+            (12, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
             arbitrary_state_color,
@@ -2186,6 +2206,7 @@ class PuzzleDetector:
                 (60, 255, 120),
                 2,
             )
+        self.mode3_preview = annotated.copy()
         status = {
             "a4_found": True,
             "a4_source": source,
@@ -2440,6 +2461,8 @@ class PuzzleVisionApp:
         self.raw_frame: np.ndarray | None = None
         self.camera_jpeg: bytes | None = None
         self.warp_jpeg: bytes | None = None
+        self.mode2_warp_jpeg: bytes | None = None
+        self.mode3_warp_jpeg: bytes | None = None
         self.mask_jpeg: bytes | None = None
         calibration = StageCalibration(
             rotation_sign=args.rotation_sign,
@@ -2845,6 +2868,14 @@ class PuzzleVisionApp:
                     self.raw_frame = sensor_frame
                     self.camera_jpeg = encode_jpeg(camera_view)
                     self.warp_jpeg = encode_jpeg(warped)
+                    mode2_preview = self.detector.mode2_preview
+                    mode3_preview = self.detector.mode3_preview
+                    self.mode2_warp_jpeg = encode_jpeg(
+                        warped if mode2_preview is None else mode2_preview
+                    )
+                    self.mode3_warp_jpeg = encode_jpeg(
+                        warped if mode3_preview is None else mode3_preview
+                    )
                     self.mask_jpeg = encode_jpeg(mask)
             except Exception as exc:
                 camera = self.camera
@@ -3059,7 +3090,7 @@ body{font-family:system-ui,"Microsoft YaHei",sans-serif;background:#101214;color
 h1{margin:.25em 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.card{background:#1b1e21;padding:12px;border-radius:9px;border:1px solid #333}
 img{width:100%;border:1px solid #555;border-radius:6px}.actions{position:sticky;top:0;background:#101214eF;padding:8px 0;z-index:3}
 button{font-size:18px;padding:11px 17px;margin:4px;border:0;border-radius:5px;color:#fff;cursor:pointer}.green{background:#168342}.blue{background:#1771b8}.purple{background:#7346b8}.red{background:#b52626}.gray{background:#555}
-button:disabled{opacity:.35;cursor:not-allowed}.badge{display:inline-block;padding:5px 9px;border-radius:15px;margin:3px;background:#555}.ok{background:#147a3a}.bad{background:#a52727}.wait{background:#996500}
+button:disabled{opacity:.35;cursor:not-allowed}.previewSelected{outline:3px solid #fff;box-shadow:0 0 0 2px #168fe5}.badge{display:inline-block;padding:5px 9px;border-radius:15px;margin:3px;background:#555}.ok{background:#147a3a}.bad{background:#a52727}.wait{background:#996500}
 table{border-collapse:collapse;width:100%;font-size:14px}th,td{border:1px solid #555;padding:6px;text-align:center}th{background:#292d31}.problem{color:#ff7979;font-weight:700}.goodtext{color:#63e18f}.muted{color:#bbb}pre{background:#080909;padding:10px;max-height:380px;overflow:auto;white-space:pre-wrap}
 input,select{font-size:15px;padding:5px;margin:3px;width:95px}@media(max-width:850px){.grid{grid-template-columns:1fr}.actions{position:static}}
 </style></head><body>
@@ -3072,6 +3103,10 @@ input,select{font-size:15px;padding:5px;margin:3px;width:95px}@media(max-width:8
  <button class="red" onclick="stopTask()">急停</button>
  <button class="gray" onclick="lockA4()">锁定当前A4物理方向</button>
  <button class="gray" onclick="autoA4()">重新自动识别A4</button>
+</div>
+<div class="actions" style="position:static">
+ <button id="view2" class="blue previewSelected" onclick="selectPreview(2,true)">查看功能2预览</button>
+ <button id="view3" class="purple" onclick="selectPreview(3,true)">查看功能3预览</button>
 </div>
 <div id="badges"></div><p id="robotmsg"></p>
 <div class="grid">
@@ -3095,10 +3130,25 @@ input,select{font-size:15px;padding:5px;margin:3px;width:95px}@media(max-width:8
 </div>
 <details><summary>实时JSON / 通信记录</summary><pre id="status">loading...</pre></details>
 <script>
-let last=null,points=[],cam=document.querySelector('#cam');
+let last=null,points=[],cam=document.querySelector('#cam'),selectedPreviewMode=0;
+let a4preview=document.querySelector('img[src="/a4.mjpg"]');
+a4preview.id='a4preview';
+a4preview.closest('.card').querySelector('h3').id='previewtitle';
 cam.onclick=async e=>{let r=cam.getBoundingClientRect(),x=(e.clientX-r.left)*cam.naturalWidth/r.width,y=(e.clientY-r.top)*cam.naturalHeight/r.height;points.push([Math.round(x),Math.round(y)]);clicks.textContent='已选'+points.length+'/4点 '+JSON.stringify(points);if(points.length===4){let z=await fetch('/api/corners',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({points})});if(!z.ok)alert(await z.text());points=[];clicks.textContent='已选0/4点'}};
 async function post(url){let r=await fetch(url,{method:'POST'}),t=await r.text();if(!r.ok)alert(t);return t}
-async function startTask(m){await post('/api/task?mode='+m)}
+function selectPreview(m,force=false){
+ if(m!==2&&m!==3)return;
+ if(selectedPreviewMode===m&&!force)return;
+ selectedPreviewMode=m;
+ a4preview.src=m===2?'/a4-mode2.mjpg':'/a4-mode3.mjpg';
+ document.querySelector('#previewtitle').textContent=m===2?'功能2预览：题图2固定矩形':'功能3预览：未知白片自动重建矩形';
+ document.querySelector('#view2').classList.toggle('previewSelected',m===2);
+ document.querySelector('#view3').classList.toggle('previewSelected',m===3);
+ document.querySelector('#p2summary').closest('.card').style.display=m===2?'block':'none';
+ document.querySelector('#p3summary').closest('.card').style.display=m===3?'block':'none';
+}
+selectPreview(2,true);
+async function startTask(m){if(m===2||m===3)selectPreview(m,true);await post('/api/task?mode='+m)}
 async function stopTask(){await post('/api/stop')}
 async function lockA4(){await post('/api/lock-a4')}
 async function autoA4(){points=[];await post('/api/auto-a4')}
@@ -3120,6 +3170,8 @@ render=function(s){
  renderModes12(s);
  let r=s.robot||{},ser=r.serial||{},m=s.motion_plans||{},a=s.arbitrary_stability||{};
  let robotBusy=!['IDLE','DONE','ERROR','REJECTED'].includes(r.state);
+ let activeMode=Number(r.active_mode||0);
+ if(robotBusy&&(activeMode===2||activeMode===3))selectPreview(activeMode);
  // Mode 3 is a true one-click workflow: it may be pressed before the visual
  // plan is stable.  The backend then waits, freezes the first stable solution,
  // and sends it automatically.  Only serial disconnect/busy robot blocks it.
@@ -3173,6 +3225,10 @@ def make_handler(app: PuzzleVisionApp):
                 self.stream("camera_jpeg")
             elif self.path == "/a4.mjpg":
                 self.stream("warp_jpeg")
+            elif self.path == "/a4-mode2.mjpg":
+                self.stream("mode2_warp_jpeg")
+            elif self.path == "/a4-mode3.mjpg":
+                self.stream("mode3_warp_jpeg")
             elif self.path == "/mask.mjpg":
                 self.stream("mask_jpeg")
             elif self.path == "/raw.jpg":
@@ -3187,10 +3243,18 @@ def make_handler(app: PuzzleVisionApp):
                     self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
                 else:
                     self.reply(jpeg, "image/jpeg")
-            elif self.path in {"/camera.jpg", "/a4.jpg", "/mask.jpg"}:
+            elif self.path in {
+                "/camera.jpg",
+                "/a4.jpg",
+                "/a4-mode2.jpg",
+                "/a4-mode3.jpg",
+                "/mask.jpg",
+            }:
                 attribute = {
                     "/camera.jpg": "camera_jpeg",
                     "/a4.jpg": "warp_jpeg",
+                    "/a4-mode2.jpg": "mode2_warp_jpeg",
+                    "/a4-mode3.jpg": "mode3_warp_jpeg",
                     "/mask.jpg": "mask_jpeg",
                 }[self.path]
                 with app.lock:
