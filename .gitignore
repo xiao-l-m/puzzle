@@ -1,0 +1,29 @@
+# Python runtime files
+**/__pycache__/
+**/.pytest_cache/
+*.py[cod]
+*.log
+*.pid
+
+# Local camera captures and generated calibration candidates
+*.jpg
+*.jpeg
+*.png
+camera_calibration*.npz
+camera_calibration*.json
+
+# Code Composer Studio generated output
+**/Debug/
+**/Release/
+*.out
+*.o
+*.d_raw
+*.map
+*.xml
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+

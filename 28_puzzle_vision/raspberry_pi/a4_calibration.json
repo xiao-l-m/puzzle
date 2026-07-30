@@ -1,0 +1,12 @@
+{
+  "physical_a4_corners_px": [
+    [157.0, 579.0],
+    [171.0, 72.0],
+    [892.0, 70.0],
+    [897.0, 587.0]
+  ],
+  "order": "A4_TOP_LEFT,TOP_RIGHT,BOTTOM_RIGHT,BOTTOM_LEFT",
+  "capture_size_px": [1280, 720],
+  "source_region": "lower",
+  "note": "Physical A4 direction corrected 180 degrees: loose pieces are in lower half"
+}
