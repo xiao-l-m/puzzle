@@ -123,3 +123,13 @@ XY可达范围固定为：`X=5.0..205.0mm`、`Y=61.0..286.0mm`。
    `STEPPER_MOTOR_5_PULSES_PER_OUTPUT_REV`。
 3. 单独确认4号轴负向0.8cm确实下降8mm、正向0.8cm能回到相同初始高度。
 4. 首次整套测试不要放铁片，手放急停旁，逐状态确认方向和行程。
+
+## 模式3：1～4片可变计划
+
+```text
+Pi  -> MCU: PLAN request_id 3 item_count
+Pi  -> MCU: ITEM request_id index pick_x10 pick_y10 place_x10 place_y10 angle_mdeg
+Pi  -> MCU: COMMIT request_id
+```
+
+`item_count` 必须是1～4，`index` 必须是 `0..item_count-1`。MCU会在任何运动前验证全部ITEM；重复ITEM返回 `ITEM_DUPLICATE`，缺失ITEM返回 `MISSING_ITEM`，0片/5片返回 `PLAN_SHAPE`。模式1、2仍可使用原来4片计划。

@@ -68,7 +68,7 @@ typedef struct {
     uint8_t mode;
     uint8_t jobCount;
     uint8_t jobIndex;
-    GantryJob jobs[GANTRY_REQUIRED_PLAN_ITEMS];
+    GantryJob jobs[GANTRY_MAX_PLAN_ITEMS];
     int32_t currentX10;
     int32_t currentY10;
     int32_t pendingX10;
@@ -77,6 +77,8 @@ typedef struct {
     int32_t pendingRotationMdeg;
     bool positionKnown;
     bool zSafe;
+    bool completionEvent;
+    bool rejectionEvent;
 } ControllerContext;
 
 static ControllerContext g_controller;
@@ -258,7 +260,7 @@ static void clear_jobs(void)
 {
     uint8_t index;
 
-    for (index = 0U; index < GANTRY_REQUIRED_PLAN_ITEMS; index++) {
+    for (index = 0U; index < GANTRY_MAX_PLAN_ITEMS; index++) {
         memset(&g_controller.jobs[index], 0, sizeof(g_controller.jobs[index]));
     }
     g_controller.jobCount = 0U;
@@ -501,6 +503,7 @@ static void finish_request(void)
     g_controller.mode = 0U;
     clear_jobs();
     g_controller.state = STATE_IDLE;
+    g_controller.completionEvent = true;
     (void)RpiLink_SendFormat("DONE %lu", (unsigned long)completed);
 }
 
@@ -528,7 +531,7 @@ void GantryController_Init(uint32_t nowMs)
     MOS_Switch_Off();
 
     (void)RpiLink_SendFormat(
-        "READY GANTRY_V1 HOME %ld %ld RANGE %ld %ld %ld %ld",
+        "READY GANTRY_V2 HOME %ld %ld RANGE %ld %ld %ld %ld",
         (long)GANTRY_HOME_X_X10, (long)GANTRY_HOME_Y_X10,
         (long)GANTRY_MIN_X_X10, (long)GANTRY_MAX_X_X10,
         (long)GANTRY_MIN_Y_X10, (long)GANTRY_MAX_Y_X10);
@@ -539,9 +542,35 @@ bool GantryController_IsIdle(void)
     return g_controller.state == STATE_IDLE;
 }
 
+bool GantryController_HasFault(void)
+{
+    return g_controller.state == STATE_FAULT;
+}
+
+bool GantryController_IsEmergencyStopped(void)
+{
+    return g_controller.state == STATE_ESTOP;
+}
+
+bool GantryController_TakeCompletionEvent(void)
+{
+    bool event = g_controller.completionEvent;
+
+    g_controller.completionEvent = false;
+    return event;
+}
+
+bool GantryController_TakeRejectionEvent(void)
+{
+    bool event = g_controller.rejectionEvent;
+
+    g_controller.rejectionEvent = false;
+    return event;
+}
+
 bool GantryController_RequestMode(uint8_t mode, uint32_t nowMs)
 {
-    if ((mode < 1U) || (mode > 2U)) {
+    if ((mode < 1U) || (mode > 3U)) {
         return false;
     }
     if (g_controller.state != STATE_IDLE) {
@@ -581,8 +610,9 @@ static void process_plan(char *tokens[TOKEN_COUNT_MAX], uint8_t count,
         (void)RpiLink_SendLine("ERR 0 BAD_PLAN");
         return;
     }
-    if ((request == 0U) || (mode < 1U) || (mode > 2U) ||
-        (itemCount != GANTRY_REQUIRED_PLAN_ITEMS)) {
+    if ((request == 0U) || (mode < 1U) || (mode > 3U) ||
+        (itemCount < GANTRY_MIN_PLAN_ITEMS) ||
+        (itemCount > GANTRY_MAX_PLAN_ITEMS)) {
         (void)RpiLink_SendFormat("ERR %lu PLAN_SHAPE",
                                  (unsigned long)request);
         return;
@@ -655,7 +685,8 @@ static void process_item(char *tokens[TOKEN_COUNT_MAX], uint8_t count,
     }
     if ((g_controller.state != STATE_WAIT_PLAN) ||
         (request != g_controller.requestId) ||
-        (g_controller.jobCount != GANTRY_REQUIRED_PLAN_ITEMS)) {
+        (g_controller.jobCount < GANTRY_MIN_PLAN_ITEMS) ||
+        (g_controller.jobCount > GANTRY_MAX_PLAN_ITEMS)) {
         (void)RpiLink_SendFormat("ERR %lu ITEM_WITHOUT_PLAN",
                                  (unsigned long)request);
         return;
@@ -684,13 +715,8 @@ static void process_item(char *tokens[TOKEN_COUNT_MAX], uint8_t count,
     }
     candidate.received = true;
     stored = &g_controller.jobs[index];
-    if (stored->received &&
-        ((stored->sourceX10 != candidate.sourceX10) ||
-         (stored->sourceY10 != candidate.sourceY10) ||
-         (stored->targetX10 != candidate.targetX10) ||
-         (stored->targetY10 != candidate.targetY10) ||
-         (stored->angleMdeg != candidate.angleMdeg))) {
-        (void)RpiLink_SendFormat("ERR %lu ITEM_CONFLICT",
+    if (stored->received) {
+        (void)RpiLink_SendFormat("ERR %lu ITEM_DUPLICATE",
                                  (unsigned long)request);
         return;
     }
@@ -713,7 +739,8 @@ static void process_commit(char *tokens[TOKEN_COUNT_MAX], uint8_t count,
     }
     if ((g_controller.state != STATE_WAIT_PLAN) ||
         (request != g_controller.requestId) ||
-        (g_controller.jobCount != GANTRY_REQUIRED_PLAN_ITEMS)) {
+        (g_controller.jobCount < GANTRY_MIN_PLAN_ITEMS) ||
+        (g_controller.jobCount > GANTRY_MAX_PLAN_ITEMS)) {
         (void)RpiLink_SendFormat("ERR %lu COMMIT_WITHOUT_PLAN",
                                  (unsigned long)request);
         return;
@@ -876,6 +903,7 @@ void GantryController_ProcessLine(char *line, uint32_t nowMs)
             clear_jobs();
             g_controller.requestId = 0U;
             g_controller.mode = 0U;
+            g_controller.rejectionEvent = true;
             g_controller.state = STATE_IDLE;
             (void)RpiLink_SendFormat("ACK %lu REJECT %s",
                                      (unsigned long)request, tokens[2]);
@@ -926,6 +954,7 @@ void GantryController_Update(uint32_t nowMs)
                 clear_jobs();
                 g_controller.requestId = 0U;
                 g_controller.mode = 0U;
+                g_controller.rejectionEvent = true;
                 g_controller.state = STATE_IDLE;
                 (void)RpiLink_SendFormat("ERR %lu PLAN_TIMEOUT",
                                          (unsigned long)request);

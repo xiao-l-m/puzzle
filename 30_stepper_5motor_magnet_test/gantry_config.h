@@ -11,7 +11,8 @@
 #define GANTRY_MIN_Y_X10              610L
 #define GANTRY_MAX_Y_X10              2860L
 
-#define GANTRY_REQUIRED_PLAN_ITEMS    4U
+#define GANTRY_MIN_PLAN_ITEMS         1U
+#define GANTRY_MAX_PLAN_ITEMS         4U
 /* Pi may wait up to 15 s for a stable multi-frame vision snapshot. */
 #define GANTRY_PLAN_TIMEOUT_MS        20000U
 

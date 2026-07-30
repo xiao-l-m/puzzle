@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 from itertools import permutations
@@ -22,6 +23,11 @@ from urllib.parse import parse_qs, urlparse
 import cv2
 import numpy as np
 
+from arbitrary_puzzle_solver import (
+    DEFAULT_DIVIDER_MARGIN_MM,
+    DEFAULT_SEAM_GAP_MM,
+    solve_arbitrary_puzzle,
+)
 from gantry_serial import GantryTaskController
 from puzzle_motion import (
     Mode1TargetLatch,
@@ -244,6 +250,11 @@ class PuzzleDetector:
         self.a4_corner_history: deque[np.ndarray] = deque(maxlen=15)
         self.divider_history: deque[float] = deque(maxlen=15)
         self.plan_history: deque[dict[str, Any]] = deque(maxlen=12)
+        self.arbitrary_piece_history: deque[dict[str, Any]] = deque(
+            maxlen=max(5, config.stable_frames)
+        )
+        self.arbitrary_solution_cache: dict[str, Any] | None = None
+        self.arbitrary_solution_reference: dict[str, Any] | None = None
 
     def stabilize_a4_corners(
         self, corners: np.ndarray
@@ -748,6 +759,272 @@ class PuzzleDetector:
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
         return mask, paper_luma, threshold, mode
 
+    def segment_arbitrary_white_pieces(
+        self, warped: np.ndarray, divider_y: int
+    ) -> tuple[np.ndarray, float, float]:
+        """Segment question-2 white pieces only in the A4 upper half."""
+        gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+        margin = int(round(4.0 * WARP_PX_PER_MM))
+        divider_margin = int(round(DEFAULT_DIVIDER_MARGIN_MM * WARP_PX_PER_MM))
+        region_end = max(margin + 20, int(divider_y) - divider_margin)
+        region_end = min(region_end, gray.shape[0] - margin)
+        roi = gray[margin:region_end, margin:gray.shape[1] - margin]
+        mask = np.zeros_like(gray)
+        if roi.size == 0:
+            return mask, 0.0, 255.0
+
+        blurred = cv2.GaussianBlur(roi, (5, 5), 0.0)
+        local_contrast = cv2.createCLAHE(
+            clipLimit=2.0, tileGridSize=(8, 8)
+        ).apply(blurred)
+        background_luma = float(np.percentile(blurred, 35.0))
+        otsu_threshold, _unused = cv2.threshold(
+            blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        # Otsu handles smooth exposure changes; the contrast floor prevents
+        # black-paper texture from becoming a false white fragment.
+        threshold = max(
+            float(otsu_threshold),
+            min(245.0, background_luma + max(22.0, self.config.contrast)),
+        )
+        local_otsu, _unused = cv2.threshold(
+            local_contrast, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        foreground = np.where(
+            (blurred >= threshold)
+            & (local_contrast >= max(105.0, float(local_otsu))),
+            255,
+            0,
+        ).astype(np.uint8)
+        foreground = cv2.morphologyEx(
+            foreground,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        )
+        foreground = cv2.morphologyEx(
+            foreground,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+        )
+        mask[margin:region_end, margin:gray.shape[1] - margin] = foreground
+        return mask, background_luma, threshold
+
+    @staticmethod
+    def _canonical_detected_polygon(polygon_mm: np.ndarray) -> np.ndarray:
+        polygon = np.asarray(polygon_mm, np.float64).reshape(-1, 2)
+        following = np.roll(polygon, -1, axis=0)
+        signed = 0.5 * float(
+            np.sum(
+                polygon[:, 0] * following[:, 1]
+                - following[:, 0] * polygon[:, 1]
+            )
+        )
+        if signed < 0.0:
+            polygon = polygon[::-1].copy()
+        start = min(
+            range(len(polygon)),
+            key=lambda index: (
+                round(float(polygon[index, 1]), 4),
+                round(float(polygon[index, 0]), 4),
+            ),
+        )
+        return np.roll(polygon, -start, axis=0)
+
+    @staticmethod
+    def _safe_pick_point(polygon_mm: np.ndarray, centroid_mm: np.ndarray) -> tuple[np.ndarray, float, str]:
+        polygon32 = np.asarray(polygon_mm, np.float32).reshape(-1, 2)
+        centroid = np.asarray(centroid_mm, np.float64).reshape(2)
+        centroid_clearance = float(
+            cv2.pointPolygonTest(polygon32, tuple(centroid), True)
+        )
+        if centroid_clearance >= 4.0:
+            return centroid, centroid_clearance, "AREA_CENTROID"
+
+        minimum = np.floor(np.min(polygon32, axis=0)).astype(int)
+        maximum = np.ceil(np.max(polygon32, axis=0)).astype(int)
+        best = centroid.copy()
+        best_clearance = centroid_clearance
+        for step in (2.0, 0.5):
+            if step == 2.0:
+                x_values = np.arange(minimum[0], maximum[0] + 0.1, step)
+                y_values = np.arange(minimum[1], maximum[1] + 0.1, step)
+            else:
+                x_values = np.arange(best[0] - 2.0, best[0] + 2.01, step)
+                y_values = np.arange(best[1] - 2.0, best[1] + 2.01, step)
+            for y_value in y_values:
+                for x_value in x_values:
+                    clearance = float(
+                        cv2.pointPolygonTest(
+                            polygon32, (float(x_value), float(y_value)), True
+                        )
+                    )
+                    if clearance > best_clearance:
+                        best_clearance = clearance
+                        best = np.asarray([x_value, y_value], np.float64)
+        return best, best_clearance, "MAX_INTERIOR_CLEARANCE"
+
+    def extract_arbitrary_white_pieces(
+        self, mask: np.ndarray
+    ) -> tuple[list[dict[str, Any]], list[np.ndarray]]:
+        contours, _hierarchy = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        scale2 = WARP_PX_PER_MM * WARP_PX_PER_MM
+        candidates: list[tuple[float, dict[str, Any], np.ndarray]] = []
+        for contour in contours:
+            area_px = float(cv2.contourArea(contour))
+            area_mm2 = area_px / scale2
+            if not 120.0 <= area_mm2 <= 11200.0:
+                continue
+            perimeter = float(cv2.arcLength(contour, True))
+            if perimeter < 40.0:
+                continue
+            moments = cv2.moments(contour)
+            if abs(float(moments["m00"])) < 1.0:
+                continue
+            centroid_mm = np.asarray(
+                [
+                    moments["m10"] / moments["m00"] / WARP_PX_PER_MM,
+                    moments["m01"] / moments["m00"] / WARP_PX_PER_MM,
+                ],
+                np.float64,
+            )
+            polygon_candidates: list[tuple[float, np.ndarray]] = []
+            for fraction in np.linspace(0.004, 0.055, 70):
+                polygon_px = cv2.approxPolyDP(
+                    contour, float(fraction) * perimeter, True
+                ).reshape(-1, 2)
+                if not 3 <= len(polygon_px) <= 5:
+                    continue
+                polygon_mm = self._canonical_detected_polygon(
+                    polygon_px.astype(np.float64) / WARP_PX_PER_MM
+                )
+                lengths = np.linalg.norm(
+                    np.roll(polygon_mm, -1, axis=0) - polygon_mm, axis=1
+                )
+                # The problem specifies >=20 mm; keep limited allowance for
+                # blur/threshold erosion, but reject clearly undersized edges.
+                if float(np.min(lengths)) < 16.0:
+                    continue
+                polygon_area_px = abs(float(cv2.contourArea(polygon_px)))
+                area_error = abs(polygon_area_px - area_px) / max(1.0, area_px)
+                cost = area_error + 0.002 * (5 - len(polygon_mm))
+                polygon_candidates.append((cost, polygon_mm))
+            if not polygon_candidates:
+                continue
+            polygon_candidates.sort(key=lambda value: value[0])
+            polygon_mm = polygon_candidates[0][1]
+            edge_lengths = np.linalg.norm(
+                np.roll(polygon_mm, -1, axis=0) - polygon_mm, axis=1
+            )
+            pick_point, pick_clearance, pick_method = self._safe_pick_point(
+                polygon_mm, centroid_mm
+            )
+            hull_area = float(cv2.contourArea(cv2.convexHull(contour)))
+            solidity = area_px / max(1.0, hull_area)
+            item = {
+                "center_mm": np.round(centroid_mm, 2).tolist(),
+                "pick_point_mm": np.round(pick_point, 2).tolist(),
+                "pick_clearance_mm": round(float(pick_clearance), 2),
+                "pick_method": pick_method,
+                "angle_deg": round(pca_angle_deg(contour), 2),
+                "area_mm2": round(area_mm2, 2),
+                "solidity": round(solidity, 3),
+                "vertex_count": int(len(polygon_mm)),
+                "edge_lengths_mm": np.round(edge_lengths, 2).tolist(),
+                "vertices_mm": np.round(polygon_mm, 2).tolist(),
+            }
+            candidates.append((area_mm2, item, contour))
+        # Stable IDs follow physical position, not contour enumeration order.
+        candidates.sort(
+            key=lambda value: (
+                float(value[1]["center_mm"][1]),
+                float(value[1]["center_mm"][0]),
+            )
+        )
+        candidates = candidates[:4]
+        pieces: list[dict[str, Any]] = []
+        selected: list[np.ndarray] = []
+        for index, (_area, item, contour) in enumerate(candidates, start=1):
+            item["id"] = f"W{index}"
+            pieces.append(item)
+            selected.append(contour)
+        return pieces, selected
+
+    def arbitrary_piece_stability(
+        self, pieces: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        if not 1 <= len(pieces) <= 4:
+            self.arbitrary_piece_history.clear()
+            return {
+                "stable": False,
+                "samples": 0,
+                "required_samples": self.arbitrary_piece_history.maxlen,
+                "center_spread_mm": None,
+                "vertex_spread_mm": None,
+                "reason": "NEED_ONE_TO_FOUR_WHITE_PIECES",
+            }
+        signature = tuple(
+            (str(piece["id"]), int(piece["vertex_count"])) for piece in pieces
+        )
+        centers = np.asarray([piece["center_mm"] for piece in pieces], np.float64)
+        vertices = [
+            np.asarray(piece["vertices_mm"], np.float64) for piece in pieces
+        ]
+        if self.arbitrary_piece_history and (
+            self.arbitrary_piece_history[-1]["signature"] != signature
+        ):
+            self.arbitrary_piece_history.clear()
+        self.arbitrary_piece_history.append(
+            {"signature": signature, "centers": centers, "vertices": vertices}
+        )
+        center_spread = 0.0
+        vertex_spread = 0.0
+        if len(self.arbitrary_piece_history) >= 2:
+            center_samples = np.stack(
+                [entry["centers"] for entry in self.arbitrary_piece_history],
+                axis=0,
+            )
+            center_median = np.median(center_samples, axis=0)
+            center_spread = float(
+                np.max(
+                    np.linalg.norm(
+                        center_samples - center_median[None, :, :], axis=2
+                    )
+                )
+            )
+            for piece_index in range(len(pieces)):
+                samples = np.stack(
+                    [
+                        entry["vertices"][piece_index]
+                        for entry in self.arbitrary_piece_history
+                    ],
+                    axis=0,
+                )
+                median = np.median(samples, axis=0)
+                vertex_spread = max(
+                    vertex_spread,
+                    float(
+                        np.max(
+                            np.linalg.norm(samples - median[None, :, :], axis=2)
+                        )
+                    ),
+                )
+        stable = bool(
+            len(self.arbitrary_piece_history)
+            >= int(self.arbitrary_piece_history.maxlen or 5)
+            and center_spread <= 0.8
+            and vertex_spread <= 1.5
+        )
+        return {
+            "stable": stable,
+            "samples": len(self.arbitrary_piece_history),
+            "required_samples": self.arbitrary_piece_history.maxlen,
+            "center_spread_mm": round(center_spread, 3),
+            "vertex_spread_mm": round(vertex_spread, 3),
+            "reason": None if stable else "WAITING_FOR_STABLE_WHITE_PIECES",
+        }
+
     def extract_pieces(
         self, mask: np.ndarray
     ) -> tuple[list[dict[str, Any]], list[np.ndarray]]:
@@ -1201,6 +1478,7 @@ class PuzzleDetector:
             corners = np.asarray(manual_corners, dtype=np.float32).reshape(4, 2)
         if corners is None:
             self.center_history.clear()
+            self.arbitrary_piece_history.clear()
             cv2.putText(
                 original, "A4 NOT FOUND - CLICK 4 CORNERS", (15, 35),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2,
@@ -1216,6 +1494,18 @@ class PuzzleDetector:
                     "piece_count": 0,
                     "stable_four_pieces": False,
                     "pieces": [],
+                    "arbitrary_piece_count": 0,
+                    "arbitrary_pieces": [],
+                    "arbitrary_stability": {
+                        "stable": False,
+                        "samples": 0,
+                        "reason": "A4_NOT_FOUND",
+                    },
+                    "arbitrary_plan": {
+                        "ready": False,
+                        "error": "A4_NOT_FOUND",
+                        "moves": [],
+                    },
                 },
                 original,
                 blank,
@@ -1300,6 +1590,111 @@ class PuzzleDetector:
                 (0, 0, 255),
                 2,
             )
+        if divider_found:
+            (
+                arbitrary_mask,
+                arbitrary_background_luma,
+                arbitrary_threshold,
+            ) = self.segment_arbitrary_white_pieces(warped, int(divider_y))
+            (
+                arbitrary_pieces,
+                arbitrary_contours,
+            ) = self.extract_arbitrary_white_pieces(arbitrary_mask)
+            arbitrary_stability = self.arbitrary_piece_stability(
+                arbitrary_pieces
+            )
+            if arbitrary_stability["stable"]:
+                current_centers = np.asarray(
+                    [piece["center_mm"] for piece in arbitrary_pieces],
+                    np.float64,
+                )
+                current_vertices = [
+                    np.asarray(piece["vertices_mm"], np.float64)
+                    for piece in arbitrary_pieces
+                ]
+                reference = self.arbitrary_solution_reference
+                cache_matches = bool(
+                    self.arbitrary_solution_cache is not None
+                    and reference is not None
+                    and reference["signature"]
+                    == tuple(
+                        (piece["id"], piece["vertex_count"])
+                        for piece in arbitrary_pieces
+                    )
+                    and float(
+                        np.max(
+                            np.linalg.norm(
+                                current_centers - reference["centers"], axis=1
+                            )
+                        )
+                    )
+                    <= 0.8
+                    and all(
+                        float(
+                            np.max(
+                                np.linalg.norm(
+                                    current_vertices[index]
+                                    - reference["vertices"][index],
+                                    axis=1,
+                                )
+                            )
+                        )
+                        <= 1.5
+                        for index in range(len(current_vertices))
+                    )
+                )
+                if cache_matches:
+                    arbitrary_plan = deepcopy(
+                        self.arbitrary_solution_cache
+                    )
+                    arbitrary_plan["cache_reused"] = True
+                else:
+                    arbitrary_plan = solve_arbitrary_puzzle(
+                        arbitrary_pieces,
+                        divider_y_mm=float(divider_y) / WARP_PX_PER_MM,
+                        seam_gap_mm=DEFAULT_SEAM_GAP_MM,
+                    )
+                    arbitrary_plan["cache_reused"] = False
+                    self.arbitrary_solution_cache = deepcopy(arbitrary_plan)
+                    self.arbitrary_solution_reference = {
+                        "signature": tuple(
+                            (piece["id"], piece["vertex_count"])
+                            for piece in arbitrary_pieces
+                        ),
+                        "centers": current_centers.copy(),
+                        "vertices": [
+                            polygon.copy() for polygon in current_vertices
+                        ],
+                    }
+            else:
+                arbitrary_plan = {
+                    "ready": False,
+                    "error": arbitrary_stability["reason"],
+                    "piece_count": len(arbitrary_pieces),
+                    "moves": [],
+                }
+            mask = cv2.bitwise_or(mask, arbitrary_mask)
+        else:
+            arbitrary_mask = np.zeros_like(gray)
+            arbitrary_background_luma = float(np.median(gray))
+            arbitrary_threshold = None
+            arbitrary_pieces = []
+            arbitrary_contours = []
+            self.arbitrary_piece_history.clear()
+            arbitrary_stability = {
+                "stable": False,
+                "samples": 0,
+                "required_samples": self.arbitrary_piece_history.maxlen,
+                "center_spread_mm": None,
+                "vertex_spread_mm": None,
+                "reason": "DIVIDER_NOT_FOUND",
+            }
+            arbitrary_plan = {
+                "ready": False,
+                "error": "DIVIDER_NOT_FOUND",
+                "piece_count": 0,
+                "moves": [],
+            }
         assembly_plan = (
             self.build_assembly_plan(
                 pieces, contours, float(divider_y) / WARP_PX_PER_MM
@@ -1333,7 +1728,15 @@ class PuzzleDetector:
                 (center[0] + 9, center[1] - 9),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 40, 230), 2,
             )
-        if assembly_plan and assembly_plan.get("target_rectangle_mm"):
+        # The fixed Figure-2 preview belongs to modes 1/2.  Do not draw a
+        # stale/low-quality template merely because build_assembly_plan()
+        # returned candidate geometry: that used to look like a mirrored
+        # mode-3 reconstruction when the white pieces were on the wrong half.
+        if (
+            assembly_plan
+            and assembly_plan.get("ready", False)
+            and assembly_plan.get("target_rectangle_mm")
+        ):
             colors = (
                 (255, 180, 0),
                 (255, 0, 180),
@@ -1393,12 +1796,120 @@ class PuzzleDetector:
                     color,
                     2,
                 )
+        for piece, contour in zip(arbitrary_pieces, arbitrary_contours):
+            cv2.drawContours(annotated, [contour], -1, (0, 255, 255), 3)
+            pick_point = tuple(
+                np.rint(
+                    np.asarray(piece["pick_point_mm"], np.float64)
+                    * WARP_PX_PER_MM
+                ).astype(int)
+            )
+            cv2.circle(annotated, pick_point, 7, (0, 0, 255), -1)
+            cv2.putText(
+                annotated,
+                f"{piece['id']} PICK({piece['pick_point_mm'][0]:.0f},"
+                f"{piece['pick_point_mm'][1]:.0f})",
+                (pick_point[0] + 8, pick_point[1] - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (0, 255, 255),
+                2,
+            )
+        if (
+            arbitrary_plan.get("ready", False)
+            and arbitrary_plan.get("target_rectangle_mm")
+        ):
+            rectangle = arbitrary_plan["target_rectangle_mm"]
+            origin = np.asarray(rectangle["origin"], np.float64)
+            size = np.asarray(rectangle["size"], np.float64)
+            cv2.rectangle(
+                annotated,
+                tuple(np.rint(origin * WARP_PX_PER_MM).astype(int)),
+                tuple(np.rint((origin + size) * WARP_PX_PER_MM).astype(int)),
+                (255, 255, 255),
+                3,
+            )
+            arbitrary_colors = (
+                (40, 180, 255),
+                (255, 120, 40),
+                (60, 255, 120),
+                (255, 60, 210),
+            )
+            for move in arbitrary_plan.get("moves", []):
+                color = arbitrary_colors[(int(move["order"]) - 1) % 4]
+                target_polygon = np.rint(
+                    np.asarray(move["target_vertices_mm"], np.float64)
+                    * WARP_PX_PER_MM
+                ).astype(np.int32)
+                cv2.polylines(annotated, [target_polygon], True, color, 3)
+                source_pick = tuple(
+                    np.rint(
+                        np.asarray(move["pick_a4_mm"], np.float64)
+                        * WARP_PX_PER_MM
+                    ).astype(int)
+                )
+                target_pick = tuple(
+                    np.rint(
+                        np.asarray(move["place_a4_mm"], np.float64)
+                        * WARP_PX_PER_MM
+                    ).astype(int)
+                )
+                cv2.arrowedLine(
+                    annotated, source_pick, target_pick, color, 2, tipLength=0.03
+                )
+                cv2.circle(annotated, target_pick, 6, color, -1)
+                cv2.putText(
+                    annotated,
+                    f"Q2 {move['order']}:{move['piece_id']} "
+                    f"R{move['rotate_deg_clockwise']:+.0f}",
+                    (target_pick[0] + 6, target_pick[1]),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    color,
+                    2,
+                )
         state_color = (0, 170, 0) if is_stable else (0, 140, 255)
         cv2.putText(
             annotated,
             f"PIECES={len(pieces)} STABLE={int(is_stable)}",
             (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, state_color, 2,
         )
+        arbitrary_state_color = (
+            (0, 190, 0)
+            if arbitrary_stability["stable"]
+            else (0, 165, 255)
+        )
+        cv2.putText(
+            annotated,
+            f"Q2_WHITE={len(arbitrary_pieces)} "
+            f"STABLE={int(arbitrary_stability['stable'])} "
+            f"SOLVED={int(bool(arbitrary_plan.get('ready', False)))}",
+            (12, 58),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            arbitrary_state_color,
+            2,
+        )
+        if divider_y is not None:
+            divider_px = int(divider_y)
+            cv2.putText(
+                annotated,
+                "MODE3 PICK ZONE (A4 UPPER)",
+                (WARP_WIDTH - 330, max(88, divider_px - 18)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 255),
+                2,
+            )
+            cv2.putText(
+                annotated,
+                "MODE3 PLACE ZONE (A4 LOWER)",
+                (WARP_WIDTH - 345, min(WARP_HEIGHT - 18, divider_px + 30)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (60, 255, 120),
+                2,
+            )
         status = {
             "a4_found": True,
             "a4_source": source,
@@ -1428,6 +1939,18 @@ class PuzzleDetector:
             "piece_count": len(pieces),
             "piece_set_quality": piece_quality,
             "stable_four_pieces": is_stable,
+            "arbitrary_piece_count": len(arbitrary_pieces),
+            "arbitrary_pieces": arbitrary_pieces,
+            "arbitrary_stability": arbitrary_stability,
+            "arbitrary_plan": arbitrary_plan,
+            "arbitrary_background_luma": round(
+                float(arbitrary_background_luma), 1
+            ),
+            "arbitrary_white_threshold": (
+                None
+                if arbitrary_threshold is None
+                else round(float(arbitrary_threshold), 1)
+            ),
             "coordinate_frame": "A4 top-left; +X right; +Y down; millimetres",
             "source_region": self.config.source_region,
             "target_region": (
@@ -1730,6 +2253,7 @@ class PuzzleVisionApp:
         self._save_a4_calibration()
         self.detector.center_history.clear()
         self.detector.plan_history.clear()
+        self.detector.arbitrary_piece_history.clear()
         self.motion_plan_stability.clear()
         self.mode1_target_latch.clear()
         self.a4_lock_method = "fresh_auto_four_piece_lock"
@@ -1808,6 +2332,7 @@ class PuzzleVisionApp:
             valid_candidates.append((total_area_error, candidate, shift))
         self.detector.center_history.clear()
         self.detector.plan_history.clear()
+        self.detector.arbitrary_piece_history.clear()
         if not valid_candidates:
             status["a4_saved_hint_orientation_error"] = (
                 "NO_ROTATION_CONTAINS_VALID_FOUR_PIECES"
@@ -1826,6 +2351,7 @@ class PuzzleVisionApp:
         self._save_a4_calibration()
         self.detector.center_history.clear()
         self.detector.plan_history.clear()
+        self.detector.arbitrary_piece_history.clear()
         self.motion_plan_stability.clear()
         self.mode1_target_latch.clear()
         self.a4_lock_method = "saved_order_after_live_geometry_verification"
@@ -1927,7 +2453,7 @@ class PuzzleVisionApp:
                     }
                 )
                 motion_plans: dict[str, Any] = {}
-                for mode in (1, 2):
+                for mode in (1, 2, 3):
                     plan = build_task_plan(
                         mode, status, self.controller.calibration
                     )
@@ -1944,7 +2470,7 @@ class PuzzleVisionApp:
                     )
                     plan["safe_time_budget"] = bool(
                         plan.get("ready", False)
-                        and plan["estimated_seconds"] <= 105.0
+                        and plan["estimated_seconds"] <= 110.0
                     )
                     blockers: list[str] = []
                     if not self.undistorter.enabled:
@@ -1966,12 +2492,13 @@ class PuzzleVisionApp:
                     )
                     if not divider_is_stable:
                         blockers.append("DIVIDER_NOT_STABLE")
-                    if not status.get("stable_four_pieces", False):
-                        blockers.append("FOUR_PIECES_NOT_STABLE")
-                    if not (status.get("piece_set_quality") or {}).get(
-                        "valid", False
-                    ):
-                        blockers.append("PIECE_SET_QUALITY_FAILED")
+                    if mode in (1, 2):
+                        if not status.get("stable_four_pieces", False):
+                            blockers.append("FOUR_PIECES_NOT_STABLE")
+                        if not (status.get("piece_set_quality") or {}).get(
+                            "valid", False
+                        ):
+                            blockers.append("PIECE_SET_QUALITY_FAILED")
                     if mode == 2:
                         assembly = status.get("assembly_plan") or {}
                         if not (
@@ -1987,6 +2514,32 @@ class PuzzleVisionApp:
                             )
                         ):
                             blockers.append("ASSEMBLY_MEASUREMENT_NOT_STABLE")
+                    if mode == 3:
+                        arbitrary_stability = (
+                            status.get("arbitrary_stability") or {}
+                        )
+                        arbitrary_plan = status.get("arbitrary_plan") or {}
+                        if not arbitrary_stability.get("stable", False):
+                            blockers.append("WHITE_PIECES_NOT_STABLE")
+                        if not 1 <= int(
+                            status.get("arbitrary_piece_count", 0)
+                        ) <= 4:
+                            blockers.append("WHITE_PIECE_COUNT_INVALID")
+                        if not arbitrary_plan.get("ready", False):
+                            blockers.append(
+                                "ARBITRARY_SOLVER_"
+                                + str(
+                                    arbitrary_plan.get(
+                                        "error", "NOT_READY"
+                                    )
+                                )
+                            )
+                        if arbitrary_plan.get("ready", False) and float(
+                            arbitrary_plan.get(
+                                "maximum_adjacent_vertex_gap_mm", 999.0
+                            )
+                        ) > 15.0:
+                            blockers.append("ADJACENT_VERTEX_GAP_OVER_15MM")
                     if blockers or not plan.get("ready", False):
                         self.motion_plan_stability.clear(mode)
                         plan_stability = {
@@ -2043,6 +2596,7 @@ class PuzzleVisionApp:
         self._save_a4_calibration()
         self.detector.center_history.clear()
         self.detector.plan_history.clear()
+        self.detector.arbitrary_piece_history.clear()
         self.motion_plan_stability.clear()
         self.mode1_target_latch.clear()
 
@@ -2061,6 +2615,7 @@ class PuzzleVisionApp:
         self._save_a4_calibration()
         self.detector.center_history.clear()
         self.detector.plan_history.clear()
+        self.detector.arbitrary_piece_history.clear()
         self.motion_plan_stability.clear()
         self.mode1_target_latch.clear()
 
@@ -2077,6 +2632,7 @@ class PuzzleVisionApp:
         self.detector.center_history.clear()
         self.detector.a4_corner_history.clear()
         self.detector.plan_history.clear()
+        self.detector.arbitrary_piece_history.clear()
         self.motion_plan_stability.clear()
         self.mode1_target_latch.clear()
 
@@ -2108,6 +2664,7 @@ class PuzzleVisionApp:
         self.detector.center_history.clear()
         self.detector.divider_history.clear()
         self.detector.plan_history.clear()
+        self.detector.arbitrary_piece_history.clear()
         self.motion_plan_stability.clear()
         self.mode1_target_latch.clear()
 
@@ -2178,21 +2735,22 @@ setInterval(async()=>{try{let s=await(await fetch('/api/status')).json();documen
 CONTROL_HTML = r"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>E题第一问：搬运与拼图</title>
+<title>E题拼图：第一大问 / 第二大问（1）</title>
 <style>
 body{font-family:system-ui,"Microsoft YaHei",sans-serif;background:#101214;color:#eee;max-width:1450px;margin:auto;padding:14px}
 h1{margin:.25em 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.card{background:#1b1e21;padding:12px;border-radius:9px;border:1px solid #333}
 img{width:100%;border:1px solid #555;border-radius:6px}.actions{position:sticky;top:0;background:#101214eF;padding:8px 0;z-index:3}
-button{font-size:18px;padding:11px 17px;margin:4px;border:0;border-radius:5px;color:#fff;cursor:pointer}.green{background:#168342}.blue{background:#1771b8}.red{background:#b52626}.gray{background:#555}
+button{font-size:18px;padding:11px 17px;margin:4px;border:0;border-radius:5px;color:#fff;cursor:pointer}.green{background:#168342}.blue{background:#1771b8}.purple{background:#7346b8}.red{background:#b52626}.gray{background:#555}
 button:disabled{opacity:.35;cursor:not-allowed}.badge{display:inline-block;padding:5px 9px;border-radius:15px;margin:3px;background:#555}.ok{background:#147a3a}.bad{background:#a52727}.wait{background:#996500}
 table{border-collapse:collapse;width:100%;font-size:14px}th,td{border:1px solid #555;padding:6px;text-align:center}th{background:#292d31}.problem{color:#ff7979;font-weight:700}.goodtext{color:#63e18f}.muted{color:#bbb}pre{background:#080909;padding:10px;max-height:380px;overflow:auto;white-space:pre-wrap}
 input,select{font-size:15px;padding:5px;margin:3px;width:95px}@media(max-width:850px){.grid{grid-template-columns:1fr}.actions{position:static}}
 </style></head><body>
-<h1>E题第一问：4片搬运 / 图2拼接</h1>
+<h1>E题拼图：第一大问 / 第二大问（1）</h1>
 <p>坐标：A4物理左上角为(0,0)，X向右、Y向下，单位mm。固定初始磁铁中心为(5,61)mm。</p>
 <div class="actions">
  <button id="mode1" class="green" onclick="startTask(1)">按键1：全部搬到上半区</button>
  <button id="mode2" class="blue" onclick="startTask(2)">按键2：拼成100×60矩形</button>
+ <button id="mode3" class="purple" onclick="startTask(3)">模式3：第二大问（1）白片自动拼矩形</button>
  <button class="red" onclick="stopTask()">急停</button>
  <button class="gray" onclick="lockA4()">锁定当前A4物理方向</button>
  <button class="gray" onclick="autoA4()">重新自动识别A4</button>
@@ -2206,6 +2764,7 @@ input,select{font-size:15px;padding:5px;margin:3px;width:95px}@media(max-width:8
  <div class="card"><h3>模式1预览：从下半区搬到分界线上方</h3><div id="p1summary"></div><div id="p1table"></div></div>
  <div class="card"><h3>模式2预览：图2目标矩形</h3><div id="p2summary"></div><div id="p2table"></div></div>
 </div>
+<div class="card" style="margin-top:12px"><h3>模式3预览：上半区1～4片白色碎片自动重建并放到下半区</h3><div id="p3summary"></div><div id="p3table"></div></div>
 <div class="card" style="margin-top:12px"><h3>识别参数</h3>
  <label>纸张 <select id="papermode"><option value="auto">自动</option><option value="black">黑纸</option><option value="white">白纸</option></select></label>
  <label>分界线Y(mm，0自动) <input id="dividery" type="number" value="0" step="0.5"></label>
@@ -2227,6 +2786,23 @@ async function applyConfig(){let q='paper_mode='+papermode.value+'&divider_y_mm=
 function esc(v){return String(v??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
 function planView(id,p){let s=document.querySelector('#p'+id+'summary'),b=document.querySelector('#p'+id+'table');if(!p){s.innerHTML='<span class=problem>尚无方案</span>';b.innerHTML='';return}let un=p.unreachable||[],bad=un.map(x=>x.piece_id+' '+x.operation+' ('+x.point_a4_mm.join(',')+')').join('；'),detail=id===1?('排布策略 '+esc(p.strategy)+(p.packing?'；总旋转 '+esc(p.packing.rotation_total_deg)+'°':'；平移 '+esc(p.common_translation_mm))):('目标 '+esc(JSON.stringify(p.target_rectangle_mm)));s.innerHTML='<b class="'+(p.ready?'goodtext':'problem')+'">'+(p.ready?'可执行':'禁止执行：'+esc(p.error))+'</b>；预计 '+p.estimated_seconds+' 秒；'+detail+(bad?'<br><span class=problem>不可达：'+esc(bad)+'</span>':'');let rows=(p.moves||[]).map(m=>{let reachable=!un.some(x=>x.piece_id===m.piece_id);return '<tr><td>'+m.order+'</td><td>'+esc(m.piece_id)+'</td><td>'+m.pick_a4_mm.join(', ')+'</td><td>'+m.place_a4_mm.join(', ')+'</td><td>'+esc(m.rotate_deg_clockwise)+'</td><td class="'+(reachable?'goodtext':'problem')+'">'+(reachable?'是':'否')+'</td></tr>'});b.innerHTML='<table><thead><tr><th>顺序</th><th>铁片</th><th>拾取A4坐标</th><th>放置A4坐标</th><th>顺时针角度</th><th>可达</th></tr></thead><tbody>'+rows.join('')+'</tbody></table>'}
 function render(s){last=s;let r=s.robot||{},ser=r.serial||{},m=s.motion_plans||{},cc=(s.config||{}).camera_calibration||{};badges.innerHTML='<span class="badge '+(s.stable_four_pieces?'ok':'wait')+'">4片稳定 '+(s.stable_four_pieces?'是':'否')+'</span><span class="badge '+(s.a4_physical_orientation_locked?'ok':'wait')+'">A4方向锁定 '+(s.a4_physical_orientation_locked?'是':'否')+'</span><span class="badge '+(cc.loaded?'ok':'wait')+'">镜头标定 '+(cc.loaded?'已加载':'未加载')+'</span><span class="badge '+(ser.connected?'ok':'bad')+'">MCU串口 '+(ser.connected?'已连接':'未连接')+'</span><span class="badge">分界线Y '+esc(s.divider_y_mm)+' mm</span><span class="badge '+(r.state==='ERROR'||r.state==='REJECTED'||r.state==='STOPPED'?'bad':'ok')+'">'+esc(r.state)+'</span>';robotmsg.textContent=r.message||'';mode1.disabled=!(m['1']&&m['1'].execution_ready)||!ser.connected;mode2.disabled=!(m['2']&&m['2'].execution_ready)||!ser.connected;planView(1,m['1']);planView(2,m['2']);status.textContent=JSON.stringify(s,null,2);let c=s.config||{};if(document.activeElement.tagName!=='INPUT'&&document.activeElement.tagName!=='SELECT'){papermode.value=c.paper_mode||'auto';dividery.value=c.divider_y_mm??0;contrast.value=c.contrast??28;minarea.value=c.min_area_mm2??100;maxarea.value=c.max_area_mm2??4500}}
+function planView3(p){
+ let s=document.querySelector('#p3summary'),b=document.querySelector('#p3table');
+ if(!p){s.innerHTML='<span class="problem">尚无模式3方案</span>';b.innerHTML='';return}
+ let un=p.unreachable||[],bad=un.map(x=>x.piece_id+' '+x.operation+' ('+(x.point_a4_mm||[]).join(',')+')').join('；');
+ let quality='最大对应顶点间距 '+esc(p.maximum_adjacent_vertex_gap_mm??'-')+' mm；最小间隙 '+esc(p.minimum_piece_clearance_mm??'-')+' mm；置信度 '+esc(p.confidence??'-')+'；裕量 '+esc(p.confidence_margin??'-');
+ s.innerHTML='<b class="'+(p.execution_ready?'goodtext':'problem')+'">'+(p.execution_ready?'可一键执行':'禁止执行：'+esc((p.execution_blockers||[]).join('；')||p.error))+'</b>；预计 '+esc(p.estimated_seconds)+' 秒；目标 '+esc(JSON.stringify(p.target_rectangle_mm))+'<br>'+quality+(bad?'<br><span class="problem">不可达：'+esc(bad)+'</span>':'');
+ let rows=(p.moves||[]).map(m=>'<tr><td>'+esc(m.order)+'</td><td>'+esc(m.piece_id)+'</td><td>'+esc((m.pick_a4_mm||[]).join(', '))+'</td><td>'+esc((m.place_a4_mm||[]).join(', '))+'</td><td>'+esc(m.rotate_deg_clockwise)+'</td><td>'+esc(m.pick_method||'面积质心')+'</td><td>'+esc(m.reachable===false?'否':'是')+'</td></tr>');
+ b.innerHTML='<table><thead><tr><th>顺序</th><th>碎片</th><th>吸取A4坐标</th><th>放置A4坐标</th><th>顺时针旋转</th><th>吸取点</th><th>可达</th></tr></thead><tbody>'+rows.join('')+'</tbody></table>';
+}
+const renderModes12=render;
+render=function(s){
+ renderModes12(s);
+ let r=s.robot||{},ser=r.serial||{},m=s.motion_plans||{},a=s.arbitrary_stability||{};
+ mode3.disabled=!(m['3']&&m['3'].execution_ready)||!ser.connected;
+ badges.innerHTML+='<span class="badge '+(a.stable?'ok':'wait')+'">模式3白片 '+esc(s.arbitrary_piece_count??0)+'片，稳定 '+(a.stable?'是':'否')+'</span>';
+ planView3(m['3']);
+};
 setInterval(async()=>{try{render(await(await fetch('/api/status')).json())}catch(e){robotmsg.textContent='网页状态读取失败：'+e}},450);
 </script></body></html>""".encode("utf-8")
 
@@ -2582,7 +3158,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--serial-baud", type=int, default=115200)
     parser.add_argument(
         "--vision-wait-seconds", type=float, default=15.0,
-        help="time after KEY to wait for one stable reachable four-piece plan",
+        help="time after a request to wait for a stable reachable 1..4-piece plan",
     )
     parser.add_argument(
         "--rotation-sign", type=float, choices=(-1.0, 1.0), default=1.0,

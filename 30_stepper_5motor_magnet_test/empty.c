@@ -11,6 +11,8 @@
 #define KEY_POLL_MS          10U
 #define KEY_DEBOUNCE_SAMPLES 3U
 #define TASK_KEY_COUNT       2U
+#define COMPLETE_LED_MS      5000U
+#define REJECT_LED_MS        4000U
 
 typedef struct {
     uint8_t raw;
@@ -27,6 +29,8 @@ static const uint32_t g_taskKeyPins[TASK_KEY_COUNT] = {
     KEYS_KEY2_PIN
 };
 static uint32_t g_lastKeyPollMs;
+static uint32_t g_completeLedUntilMs;
+static uint32_t g_rejectLedUntilMs;
 static bool g_emergencyHandled;
 
 void SysTick_Handler(void)
@@ -113,6 +117,8 @@ int main(void)
     task_keys_init();
 
     g_lastKeyPollMs = g_milliseconds;
+    g_completeLedUntilMs = 0U;
+    g_rejectLedUntilMs = 0U;
     g_emergencyRequested = emergency_is_pressed();
     g_emergencyHandled = false;
 
@@ -142,8 +148,42 @@ int main(void)
 
         GantryController_Update(nowMs);
 
-        /* Solid LED means a request is active or the controller is stopped. */
-        if (GantryController_IsIdle()) {
+        if (GantryController_TakeCompletionEvent()) {
+            g_completeLedUntilMs = nowMs + COMPLETE_LED_MS;
+        }
+        if (GantryController_TakeRejectionEvent()) {
+            g_rejectLedUntilMs = nowMs + REJECT_LED_MS;
+        }
+
+        /* Emergency: very fast blink. Motion fault: fast blink.
+         * Solver/plan rejection: medium blink. Complete: slow blink.
+         * Active request: solid. Normal idle: off.
+         */
+        if (GantryController_IsEmergencyStopped()) {
+            if (((nowMs / 60U) & 1U) != 0U) {
+                DL_GPIO_setPins(LED1_PORT, LED1_PIN_22_PIN);
+            } else {
+                DL_GPIO_clearPins(LED1_PORT, LED1_PIN_22_PIN);
+            }
+        } else if (GantryController_HasFault()) {
+            if (((nowMs / 100U) & 1U) != 0U) {
+                DL_GPIO_setPins(LED1_PORT, LED1_PIN_22_PIN);
+            } else {
+                DL_GPIO_clearPins(LED1_PORT, LED1_PIN_22_PIN);
+            }
+        } else if ((int32_t)(g_rejectLedUntilMs - nowMs) > 0) {
+            if (((nowMs / 500U) & 1U) != 0U) {
+                DL_GPIO_setPins(LED1_PORT, LED1_PIN_22_PIN);
+            } else {
+                DL_GPIO_clearPins(LED1_PORT, LED1_PIN_22_PIN);
+            }
+        } else if ((int32_t)(g_completeLedUntilMs - nowMs) > 0) {
+            if (((nowMs / 250U) & 1U) != 0U) {
+                DL_GPIO_setPins(LED1_PORT, LED1_PIN_22_PIN);
+            } else {
+                DL_GPIO_clearPins(LED1_PORT, LED1_PIN_22_PIN);
+            }
+        } else if (GantryController_IsIdle()) {
             DL_GPIO_clearPins(LED1_PORT, LED1_PIN_22_PIN);
         } else {
             DL_GPIO_setPins(LED1_PORT, LED1_PIN_22_PIN);

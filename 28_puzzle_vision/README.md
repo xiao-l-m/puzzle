@@ -122,3 +122,7 @@ python3 puzzle_vision.py --self-test
 - `POST /api/task?mode=1`：网页模拟按键1
 - `POST /api/task?mode=2`：网页模拟按键2
 - `POST /api/stop`：急停
+
+## 第二大问第（1）小问
+
+上半区1～4片白色碎片自动重建与下半区抓放的模式3说明见 [MODE3_QUESTION2_1.md](MODE3_QUESTION2_1.md)。网页接口为 `POST /api/task?mode=3`。

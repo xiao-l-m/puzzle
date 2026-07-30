@@ -136,7 +136,7 @@ class MotionPlanStabilityGate:
     @staticmethod
     def _snapshot(mode: int, plan: dict[str, Any]) -> dict[str, Any] | None:
         moves = list(plan.get("moves") or [])
-        if not plan.get("ready", False) or len(moves) != 4:
+        if not plan.get("ready", False) or not 1 <= len(moves) <= 4:
             return None
         moves.sort(key=lambda move: int(move.get("order", 0)))
         categories: list[tuple[Any, ...]] = []
@@ -197,7 +197,7 @@ class MotionPlanStabilityGate:
         position_spread = 0.0
         angle_spread = 0.0
         if len(history) >= 2:
-            for move_index in range(4):
+            for move_index in range(len(snapshot["points"])):
                 coordinates = [sample["points"][move_index] for sample in history]
                 medians = [
                     _median(point[coordinate] for point in coordinates)
@@ -1391,6 +1391,99 @@ def build_assembly_motion_plan(
     }
 
 
+def build_arbitrary_motion_plan(
+    status: dict[str, Any],
+    calibration: StageCalibration = StageCalibration(),
+) -> dict[str, Any]:
+    """Build question-2(1) mode 3 from the frozen arbitrary-piece solver."""
+    if not bool(
+        status.get("a4_physical_orientation_locked", False)
+        or (status.get("config") or {}).get("a4_locked", False)
+    ):
+        return _not_ready(3, "A4_PHYSICAL_ORIENTATION_NOT_LOCKED")
+    stability = status.get("arbitrary_stability") or {}
+    if not stability.get("stable", False):
+        return _not_ready(
+            3,
+            "WAITING_FOR_STABLE_WHITE_PIECES",
+            arbitrary_stability=stability,
+        )
+    source = status.get("arbitrary_plan") or {}
+    if not source.get("ready", False):
+        return _not_ready(
+            3,
+            "ARBITRARY_PUZZLE_PLAN_NOT_READY",
+            solver_error=source.get("error"),
+        )
+    source_moves = list(source.get("moves") or [])
+    expected_count = int(source.get("piece_count", len(source_moves)))
+    if not 1 <= expected_count <= 4 or len(source_moves) != expected_count:
+        return _not_ready(3, "ARBITRARY_MOVE_COUNT_INVALID")
+
+    moves: list[dict[str, Any]] = []
+    unreachable: list[dict[str, Any]] = []
+    for source_move in source_moves:
+        piece_id = str(source_move.get("piece_id", "?"))
+        pick = calibration.clamp_visual_boundary_noise(
+            source_move["pick_a4_mm"]
+        )
+        place = calibration.clamp_visual_boundary_noise(
+            source_move["place_a4_mm"]
+        )
+        source_problem = _check_point(calibration, pick, piece_id, "PICK")
+        target_problem = _check_point(calibration, place, piece_id, "PLACE")
+        if source_problem is not None:
+            unreachable.append(source_problem)
+        if target_problem is not None:
+            unreachable.append(target_problem)
+        rotation = float(source_move.get("rotate_deg_clockwise", 0.0))
+        rotation = _angle_delta_deg(rotation, 0.0)
+        moves.append(
+            {
+                "order": int(source_move.get("order", len(moves) + 1)),
+                "piece_id": piece_id,
+                "target_piece": "ARBITRARY_RECTANGLE",
+                "pick_a4_mm": [round(float(value), 2) for value in pick],
+                "place_a4_mm": [round(float(value), 2) for value in place],
+                "pick_stage_mm": calibration.a4_to_stage_mm(pick),
+                "place_stage_mm": calibration.a4_to_stage_mm(place),
+                "rotate_deg_clockwise": round(rotation, 2),
+                "motor5_rotate_deg": round(
+                    calibration.rotation_sign * rotation, 2
+                ),
+                "target_vertices_mm": source_move.get(
+                    "target_vertices_mm", []
+                ),
+                "pick_method": source_move.get("pick_method"),
+            }
+        )
+    moves.sort(key=lambda move: int(move["order"]))
+    return {
+        "mode": 3,
+        "name": "QUESTION_2_1_ARBITRARY_WHITE_RECTANGLE",
+        "ready": not unreachable and len(moves) == expected_count,
+        "error": None if not unreachable else "STAGE_POINT_UNREACHABLE",
+        "piece_count": expected_count,
+        "source_region": "upper",
+        "target_region": "lower",
+        "target_rectangle_mm": source.get("target_rectangle_mm"),
+        "solver": source.get("solver"),
+        "solver_score": source.get("score"),
+        "confidence_margin": source.get("confidence_margin"),
+        "confidence": source.get("confidence"),
+        "actual_seam_gap_mm": source.get("actual_seam_gap_mm"),
+        "minimum_piece_clearance_mm": source.get(
+            "minimum_piece_clearance_mm"
+        ),
+        "maximum_adjacent_vertex_gap_mm": source.get(
+            "maximum_adjacent_vertex_gap_mm"
+        ),
+        "stage_calibration": asdict(calibration),
+        "unreachable": unreachable,
+        "moves": moves,
+    }
+
+
 def build_task_plan(
     mode: int,
     status: dict[str, Any],
@@ -1400,6 +1493,8 @@ def build_task_plan(
         return build_transfer_plan(status, calibration)
     if mode == 2:
         return build_assembly_motion_plan(status, calibration)
+    if mode == 3:
+        return build_arbitrary_motion_plan(status, calibration)
     return _not_ready(mode, "UNKNOWN_MODE")
 
 
@@ -1505,6 +1600,7 @@ __all__ = [
     "MotionPlanStabilityGate",
     "StageCalibration",
     "build_assembly_motion_plan",
+    "build_arbitrary_motion_plan",
     "build_task_plan",
     "build_transfer_plan",
     "estimate_plan_seconds",

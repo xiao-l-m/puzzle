@@ -80,3 +80,6 @@ python3 puzzle_vision.py --self-test
 
 更详细的标定、协议和安全说明见两个子工程中的 README 与 `RASPBERRY_PI_PROTOCOL.md`。
 
+## 第二大问第（1）小问
+
+新增模式3：识别A4上半区1～4片白色碎片，不依赖固定模板自动重建规定尺寸的矩形，计算安全吸取点、刚体旋转后的放置点与最短抓放顺序，再搬运到下半区。详见 [28_puzzle_vision/MODE3_QUESTION2_1.md](28_puzzle_vision/MODE3_QUESTION2_1.md)。

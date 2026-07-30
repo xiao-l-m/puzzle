@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections import deque
 from copy import deepcopy
+import json
 import os
 from pathlib import Path
 import queue
@@ -22,7 +23,7 @@ from typing import Any, Callable
 from puzzle_motion import StageCalibration, build_task_plan, estimate_plan_seconds
 
 
-MAX_SAFE_PLAN_SECONDS = 105.0
+MAX_SAFE_PLAN_SECONDS = 110.0
 UART_CONSOLE_CONFLICT = "UART_CONSOLE_CONFLICT"
 
 try:
@@ -261,7 +262,7 @@ class GantryTaskController:
         self.requests: queue.Queue[tuple[int, int, str]] = queue.Queue(maxsize=4)
         self.running = True
         self.state = "IDLE"
-        self.message = "等待按键1或按键2"
+        self.message = "等待按键1、按键2或网页模式3"
         self.active_request_id: int | None = None
         self.active_mode: int | None = None
         self.frozen_plan: dict[str, Any] | None = None
@@ -269,6 +270,9 @@ class GantryTaskController:
         self.history: deque[str] = deque(maxlen=40)
         self.seen_requests: deque[int] = deque(maxlen=32)
         self.manual_sequence = 1_000_000
+        self.request_started_unix: float | None = None
+        self.audit_log_dir = Path(__file__).with_name("task_logs")
+        self.active_audit_file: Path | None = None
         self.link = GantrySerialLink(
             serial_device, serial_baud, self._on_serial_line
         )
@@ -290,6 +294,30 @@ class GantryTaskController:
             self.state = state
             self.message = message
             self.last_error = error
+
+    def _write_audit(self, event: str, payload: dict[str, Any]) -> None:
+        """Persist the frozen geometry and execution outcome for reports."""
+        try:
+            self.audit_log_dir.mkdir(parents=True, exist_ok=True)
+            if self.active_audit_file is None:
+                request = self.active_request_id or 0
+                stamp = time.strftime("%Y%m%d_%H%M%S")
+                self.active_audit_file = self.audit_log_dir / (
+                    f"task_{stamp}_{request}.json"
+                )
+            existing: dict[str, Any] = {}
+            if self.active_audit_file.exists():
+                existing = json.loads(
+                    self.active_audit_file.read_text(encoding="utf-8")
+                )
+            existing[event] = payload
+            existing["updated_unix"] = round(time.time(), 3)
+            self.active_audit_file.write_text(
+                json.dumps(existing, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            self._record("AUDIT_LOG_FAILED " + str(exc))
 
     @staticmethod
     def _parse_int(text: str) -> int:
@@ -335,22 +363,41 @@ class GantryTaskController:
                 request_id = self._parse_int(fields[1])
             except ValueError:
                 return
+            completed = False
             with self.lock:
                 if request_id == self.active_request_id:
                     self.state = "DONE"
                     self.message = "任务完成，电磁铁已关闭"
                     self.last_error = None
+                    completed = True
+            if completed:
+                elapsed = (
+                    None
+                    if self.request_started_unix is None
+                    else round(time.time() - self.request_started_unix, 3)
+                )
+                self._write_audit(
+                    "execution_result",
+                    {"state": "DONE", "actual_seconds": elapsed},
+                )
             return
         if command == "ERR" and len(fields) >= 3:
             try:
                 request_id = self._parse_int(fields[1])
             except ValueError:
                 return
+            failed = False
             with self.lock:
                 if request_id == self.active_request_id:
                     self.state = "ERROR"
                     self.message = " ".join(fields[2:])
                     self.last_error = self.message
+                    failed = True
+            if failed:
+                self._write_audit(
+                    "execution_result",
+                    {"state": "ERROR", "reason": " ".join(fields[2:])},
+                )
 
     def request_task(
         self,
@@ -358,8 +405,8 @@ class GantryTaskController:
         request_id: int | None = None,
         source: str = "WEB",
     ) -> int:
-        if mode not in (1, 2):
-            raise ValueError("mode must be 1 or 2")
+        if mode not in (1, 2, 3):
+            raise ValueError("mode must be 1, 2 or 3")
         with self.lock:
             if request_id is None:
                 self.manual_sequence += 1
@@ -378,6 +425,8 @@ class GantryTaskController:
             self.active_mode = mode
             self.frozen_plan = None
             self.last_error = None
+            self.request_started_unix = time.time()
+            self.active_audit_file = None
         try:
             self.requests.put_nowait((request_id, mode, source))
         except queue.Full as exc:
@@ -389,6 +438,9 @@ class GantryTaskController:
     def _reject(self, request_id: int, error: str) -> None:
         self._set_state("REJECTED", error, error)
         self._record(f"计划拒绝 seq={request_id}: {error}")
+        self._write_audit(
+            "execution_result", {"state": "REJECTED", "reason": error}
+        )
         try:
             self.link.send(f"REJECT {request_id} {error}")
         except Exception:
@@ -399,22 +451,43 @@ class GantryTaskController:
         last_error = "VISION_NOT_READY"
         while self.running and time.monotonic() < deadline:
             status = self.status_provider()
-            plan = build_task_plan(mode, status, self.calibration)
-            last_error = str(plan.get("error") or "VISION_NOT_READY")
-            if plan.get("ready", False):
+            published = status.get("motion_plans", {}).get(str(mode))
+            plan = (
+                deepcopy(published)
+                if isinstance(published, dict)
+                else build_task_plan(mode, status, self.calibration)
+            )
+            blockers = plan.get("execution_blockers", [])
+            last_error = str(
+                (blockers[0] if blockers else None)
+                or plan.get("error")
+                or "VISION_NOT_READY"
+            )
+            plan_ready = bool(
+                plan.get("execution_ready", plan.get("ready", False))
+            )
+            if plan_ready:
                 frozen = deepcopy(plan)
                 frozen["request_id"] = request_id
                 frozen["estimated_seconds"] = estimate_plan_seconds(
                     frozen, self.calibration
                 )
                 if frozen["estimated_seconds"] > MAX_SAFE_PLAN_SECONDS:
-                    self._reject(request_id, "PLAN_EXCEEDS_105_SECONDS")
+                    self._reject(request_id, "PLAN_EXCEEDS_110_SECONDS")
                     return None
                 frozen["frozen_at_unix"] = round(time.time(), 3)
+                frozen["vision_snapshot"] = {
+                    "divider_y_mm": status.get("divider_y_mm"),
+                    "arbitrary_piece_count": status.get("arbitrary_piece_count"),
+                    "arbitrary_pieces": status.get("arbitrary_pieces"),
+                    "arbitrary_stability": status.get("arbitrary_stability"),
+                    "arbitrary_plan": status.get("arbitrary_plan"),
+                }
+                self._write_audit("frozen_plan", frozen)
                 return frozen
             self._set_state(
                 "WAITING_VISION",
-                f"等待稳定4片与可达坐标：{last_error}",
+                f"等待模式{mode}的稳定视觉与可达坐标：{last_error}",
             )
             time.sleep(0.15)
         self._reject(request_id, last_error)
@@ -436,8 +509,8 @@ class GantryTaskController:
 
     def _send_plan(self, request_id: int, mode: int, plan: dict[str, Any]) -> None:
         moves = list(plan.get("moves") or [])
-        if len(moves) != 4:
-            raise ValueError("plan must contain exactly four moves")
+        if not 1 <= len(moves) <= 4:
+            raise ValueError("plan must contain one to four moves")
         if not self.link.wait_connected(3.0):
             raise SerialLinkError(self.link.status().get("error") or "serial disconnected")
         lines = [f"PLAN {request_id} {mode} {len(moves)}"]
@@ -466,7 +539,7 @@ class GantryTaskController:
                     self.frozen_plan = plan
                     self.state = "SENDING_PLAN"
                     self.message = (
-                        f"已冻结模式{mode}的4片坐标，预计"
+                        f"已冻结模式{mode}的{len(plan.get('moves', []))}片坐标，预计"
                         f"{plan['estimated_seconds']}秒"
                     )
                 self._send_plan(request_id, mode, plan)

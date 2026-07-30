@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 import time
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -197,46 +198,72 @@ class GantryProtocolTests(unittest.TestCase):
                 vision_wait_seconds=0.5,
             )
             try:
-                request_id = controller.request_task(1, 7001, "TEST_KEY")
-                self.assertEqual(request_id, 7001)
-                self.assertTrue(
-                    wait_until(
-                        lambda: controller.status()["state"] == "WAITING_MCU"
-                    ),
-                    controller.status(),
-                )
-
-                first_status = controller.status()
-                frozen = deepcopy(first_status["frozen_plan"])
-                self.assertIsNotNone(frozen)
-                self.assertEqual(frozen["request_id"], 7001)
-                self.assertEqual(len(frozen["moves"]), 4)
-                sent_before_duplicate = list(controller.link.sent)
-                queue_size_before = controller.requests.qsize()
-
-                # A live camera update after motion starts must not alter the
-                # immutable plan that was already transmitted to the MCU.
-                live_status["pieces"][0]["center_mm"] = [190.0, 140.0]
-                live_status["pieces"][0]["vertices_mm"] = [
-                    [185.0, 135.0],
-                    [195.0, 135.0],
-                    [190.0, 145.0],
-                ]
-                live_status["stable_four_pieces"] = False
-                time.sleep(0.08)
-                self.assertEqual(controller.status()["frozen_plan"], frozen)
-
-                duplicate = controller.request_task(2, 7001, "REPEATED_KEY")
-                self.assertEqual(duplicate, 7001)
-                time.sleep(0.08)
-                self.assertEqual(controller.requests.qsize(), queue_size_before)
-                self.assertEqual(controller.link.sent, sent_before_duplicate)
-                self.assertEqual(controller.status()["frozen_plan"], frozen)
-                self.assertTrue(
-                    any(
-                        "duplicate KEY 7001 ignored" in entry
-                        for entry in controller.status()["history"]
+                with tempfile.TemporaryDirectory() as audit_dir:
+                    controller.audit_log_dir = gantry_serial.Path(audit_dir)
+                    request_id = controller.request_task(1, 7001, "TEST_KEY")
+                    self.assertEqual(request_id, 7001)
+                    self.assertTrue(
+                        wait_until(
+                            lambda: controller.status()["state"] == "WAITING_MCU"
+                        ),
+                        controller.status(),
                     )
+
+                    first_status = controller.status()
+                    frozen = deepcopy(first_status["frozen_plan"])
+                    self.assertIsNotNone(frozen)
+                    self.assertEqual(frozen["request_id"], 7001)
+                    self.assertEqual(len(frozen["moves"]), 4)
+                    sent_before_duplicate = list(controller.link.sent)
+                    queue_size_before = controller.requests.qsize()
+
+                    # A live camera update after motion starts must not alter the
+                    # immutable plan that was already transmitted to the MCU.
+                    live_status["pieces"][0]["center_mm"] = [190.0, 140.0]
+                    live_status["pieces"][0]["vertices_mm"] = [
+                        [185.0, 135.0],
+                        [195.0, 135.0],
+                        [190.0, 145.0],
+                    ]
+                    live_status["stable_four_pieces"] = False
+                    time.sleep(0.08)
+                    self.assertEqual(controller.status()["frozen_plan"], frozen)
+
+                    duplicate = controller.request_task(2, 7001, "REPEATED_KEY")
+                    self.assertEqual(duplicate, 7001)
+                    time.sleep(0.08)
+                    self.assertEqual(controller.requests.qsize(), queue_size_before)
+                    self.assertEqual(controller.link.sent, sent_before_duplicate)
+                    self.assertEqual(controller.status()["frozen_plan"], frozen)
+                    self.assertTrue(
+                        any(
+                            "duplicate KEY 7001 ignored" in entry
+                            for entry in controller.status()["history"]
+                        )
+                    )
+            finally:
+                controller.close()
+
+    def test_mode3_sends_one_to_four_items(self):
+        with patch.object(gantry_serial, "GantrySerialLink", FakeSerialLink):
+            controller = GantryTaskController(
+                lambda: {}, "/dev/fake-gantry", 115200
+            )
+            try:
+                moves = [
+                    {
+                        "pick_a4_mm": [50.0 + index, 90.0],
+                        "place_a4_mm": [80.0 + index, 180.0],
+                        "motor5_rotate_deg": 10.0 * index,
+                    }
+                    for index in range(2)
+                ]
+                controller._send_plan(9001, 3, {"moves": moves})
+                self.assertEqual(controller.link.sent[0], "PLAN 9001 3 2")
+                self.assertEqual(controller.link.sent[-1], "COMMIT 9001")
+                self.assertEqual(
+                    len([line for line in controller.link.sent if line.startswith("ITEM ")]),
+                    2,
                 )
             finally:
                 controller.close()
