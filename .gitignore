@@ -4,6 +4,7 @@
 *.py[cod]
 *.log
 *.pid
+**/task_logs/
 
 # Local camera captures and generated calibration candidates
 *.jpg
@@ -26,4 +27,3 @@ camera_calibration*.json
 .idea/
 .DS_Store
 Thumbs.db
-

@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections import deque
 from copy import deepcopy
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -88,6 +89,12 @@ def detect_uart_console_conflict(
 class GantrySerialLink:
     """Reconnectable newline protocol on the Raspberry Pi primary UART."""
 
+    # A floating/noisy RX pin can occasionally produce a byte followed by a
+    # newline.  Do not let such data masquerade as a healthy MCU heartbeat.
+    MCU_RESPONSE_PREFIXES = frozenset(
+        {"READY", "PONG", "STATE", "ACK", "DONE", "ERR", "KEY", "STATUS"}
+    )
+
     def __init__(
         self,
         device: str,
@@ -107,8 +114,23 @@ class GantrySerialLink:
         self.last_rx: str | None = None
         self.last_tx: str | None = None
         self.last_rx_monotonic: float | None = None
+        self.last_invalid_rx: str | None = None
+        self.invalid_rx_count = 0
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
+
+    @classmethod
+    def _decode_protocol_line(cls, raw: bytes) -> str | None:
+        """Decode one valid MCU response, rejecting noise and foreign UARTs."""
+
+        try:
+            line = raw.decode("ascii", errors="strict").strip()
+        except UnicodeDecodeError:
+            return None
+        if not line or any(ord(char) < 0x20 for char in line):
+            return None
+        prefix = line.split(maxsplit=1)[0].upper()
+        return line if prefix in cls.MCU_RESPONSE_PREFIXES else None
 
     def _set_port(self, port: Any | None, error: str | None = None) -> None:
         with self.lock:
@@ -182,8 +204,11 @@ class GantrySerialLink:
                                 self.last_tx = "PING"
                         last_ping = now
                     continue
-                line = raw.decode("ascii", errors="replace").strip()
-                if not line:
+                line = self._decode_protocol_line(raw)
+                if line is None:
+                    with self.lock:
+                        self.invalid_rx_count += 1
+                        self.last_invalid_rx = raw.hex(" ")[:160]
                     continue
                 with self.lock:
                     self.last_rx = line
@@ -229,6 +254,7 @@ class GantrySerialLink:
                 "port_open": self.port is not None,
                 "connected": (
                     self.port is not None
+                    and self.connected_event.is_set()
                     and rx_age is not None
                     and rx_age <= 2.5
                 ),
@@ -236,6 +262,8 @@ class GantrySerialLink:
                 "last_rx": self.last_rx,
                 "last_tx": self.last_tx,
                 "last_rx_age_seconds": rx_age,
+                "invalid_rx_count": self.invalid_rx_count,
+                "last_invalid_rx_hex": self.last_invalid_rx,
             }
 
     def close(self) -> None:
@@ -246,6 +274,13 @@ class GantrySerialLink:
 
 class GantryTaskController:
     """Queue button requests, freeze a stable plan, and send it once."""
+
+    # A physical KEY press is also the measurement start.  Never let a plan
+    # that was published before that edge reach the gantry: wait until the
+    # camera has produced this many new processed frames first.  Eight frames
+    # is under one second at the normal Pi frame rate and still covers the
+    # detector's multi-frame stability gates.
+    FRESH_VISION_FRAMES_AFTER_REQUEST = 8
 
     def __init__(
         self,
@@ -259,7 +294,9 @@ class GantryTaskController:
         self.calibration = calibration
         self.vision_wait_seconds = float(vision_wait_seconds)
         self.lock = threading.Lock()
-        self.requests: queue.Queue[tuple[int, int, str]] = queue.Queue(maxsize=4)
+        self.requests: queue.Queue[tuple[int, int, str, int | None]] = queue.Queue(
+            maxsize=4
+        )
         self.running = True
         self.state = "IDLE"
         self.message = "等待按键1、按键2或网页模式3"
@@ -271,6 +308,7 @@ class GantryTaskController:
         self.seen_requests: deque[int] = deque(maxlen=32)
         self.manual_sequence = 1_000_000
         self.request_started_unix: float | None = None
+        self.request_vision_frame_index: int | None = None
         self.audit_log_dir = Path(__file__).with_name("task_logs")
         self.active_audit_file: Path | None = None
         self.link = GantrySerialLink(
@@ -407,6 +445,16 @@ class GantryTaskController:
     ) -> int:
         if mode not in (1, 2, 3):
             raise ValueError("mode must be 1, 2 or 3")
+        # Capture this before queuing so the freshness window begins at the
+        # actual button/API edge, not whenever the worker happens to wake.
+        try:
+            request_status = self.status_provider()
+            request_frame = request_status.get("vision_frame_index")
+            request_frame = (
+                int(request_frame) if request_frame is not None else None
+            )
+        except (TypeError, ValueError, AttributeError):
+            request_frame = None
         with self.lock:
             if request_id is None:
                 self.manual_sequence += 1
@@ -426,13 +474,88 @@ class GantryTaskController:
             self.frozen_plan = None
             self.last_error = None
             self.request_started_unix = time.time()
+            self.request_vision_frame_index = request_frame
             self.active_audit_file = None
         try:
-            self.requests.put_nowait((request_id, mode, source))
+            self.requests.put_nowait((request_id, mode, source, request_frame))
         except queue.Full as exc:
             self._set_state("ERROR", "任务队列已满", "QUEUE_FULL")
             raise RuntimeError("task queue is full") from exc
         self._record(f"{source} 请求模式{mode} seq={request_id}")
+        return request_id
+
+    def _prepare_direct_request(
+        self, mode: int, plan: dict[str, Any], message: str
+    ) -> int:
+        with self.lock:
+            if self.state not in {"IDLE", "DONE", "ERROR", "REJECTED"}:
+                raise RuntimeError("another task is active")
+            self.manual_sequence += 1
+            request_id = self.manual_sequence
+            self.seen_requests.append(request_id)
+            self.state = "SENDING_DIRECT"
+            self.message = message
+            self.active_request_id = request_id
+            self.active_mode = mode
+            self.frozen_plan = deepcopy(plan)
+            self.last_error = None
+            self.request_started_unix = time.time()
+            self.active_audit_file = None
+        return request_id
+
+    def _send_direct_command(self, request_id: int, command: str) -> None:
+        try:
+            if not self.link.wait_connected(2.0):
+                raise SerialLinkError(
+                    self.link.status().get("error") or "serial disconnected"
+                )
+            self.link.send(command)
+            self._record("PI> " + command)
+            with self.lock:
+                if self.state == "SENDING_DIRECT":
+                    self.state = "WAITING_MCU"
+                    self.message = "命令已发送，等待滑台完成"
+        except Exception as exc:
+            self._set_state("ERROR", str(exc), "DIRECT_COMMAND_FAILED")
+            raise
+
+    def request_probe(self, x_mm: float, y_mm: float) -> int:
+        """Move XY to an A4 point, then lower Z by the configured 9 mm."""
+        x_mm = float(x_mm)
+        y_mm = float(y_mm)
+        if not math.isfinite(x_mm) or not math.isfinite(y_mm):
+            raise ValueError("probe coordinate must be finite")
+        if not self.calibration.point_is_reachable((x_mm, y_mm)):
+            raise ValueError(
+                "clicked point is outside reachable A4 range "
+                f"X={self.calibration.x_min_a4_mm:.1f}.."
+                f"{self.calibration.x_max_a4_mm:.1f}, "
+                f"Y={self.calibration.y_min_a4_mm:.1f}.."
+                f"{self.calibration.y_max_a4_mm:.1f} mm"
+            )
+        target = [round(x_mm, 1), round(y_mm, 1)]
+        plan = {"type": "click_probe", "target_a4_mm": target, "z_down_mm": 12.0}
+        request_id = self._prepare_direct_request(
+            4, plan, f"点击定位：先移动到({target[0]}, {target[1]})mm，再下降12mm"
+        )
+        command = (
+            f"PROBE {request_id} {int(round(x_mm * 10.0))} "
+            f"{int(round(y_mm * 10.0))}"
+        )
+        self._send_direct_command(request_id, command)
+        return request_id
+
+    def request_probe_home(self) -> int:
+        """Raise Z if needed and return XY to the calibrated start point."""
+        home = [
+            self.calibration.home_x_a4_mm,
+            self.calibration.home_y_a4_mm,
+        ]
+        plan = {"type": "click_probe_home", "target_a4_mm": home}
+        request_id = self._prepare_direct_request(
+            5, plan, "点击定位测试：Z抬起并回初始点"
+        )
+        self._send_direct_command(request_id, f"PROBEHOME {request_id}")
         return request_id
 
     def _reject(self, request_id: int, error: str) -> None:
@@ -446,11 +569,40 @@ class GantryTaskController:
         except Exception:
             pass
 
-    def _wait_for_plan(self, request_id: int, mode: int) -> dict[str, Any] | None:
+    def _wait_for_plan(
+        self,
+        request_id: int,
+        mode: int,
+        request_frame: int | None,
+    ) -> dict[str, Any] | None:
         deadline = time.monotonic() + self.vision_wait_seconds
         last_error = "VISION_NOT_READY"
         while self.running and time.monotonic() < deadline:
             status = self.status_provider()
+            current_frame = status.get("vision_frame_index")
+            fresh_frame_count: int | None = None
+            if request_frame is not None and current_frame is not None:
+                try:
+                    fresh_frame_count = int(current_frame) - request_frame
+                except (TypeError, ValueError):
+                    fresh_frame_count = None
+            if (
+                fresh_frame_count is not None
+                and fresh_frame_count < self.FRESH_VISION_FRAMES_AFTER_REQUEST
+            ):
+                last_error = (
+                    "WAITING_FOR_FRESH_FRAMES_"
+                    f"{max(0, fresh_frame_count)}_OF_"
+                    f"{self.FRESH_VISION_FRAMES_AFTER_REQUEST}"
+                )
+                self._set_state(
+                    "WAITING_VISION",
+                    "按键计时已开始，等待移除遮挡后的新画面稳定："
+                    f"{max(0, fresh_frame_count)}/"
+                    f"{self.FRESH_VISION_FRAMES_AFTER_REQUEST}帧",
+                )
+                time.sleep(0.05)
+                continue
             published = status.get("motion_plans", {}).get(str(mode))
             plan = (
                 deepcopy(published)
@@ -477,6 +629,9 @@ class GantryTaskController:
                     return None
                 frozen["frozen_at_unix"] = round(time.time(), 3)
                 frozen["vision_snapshot"] = {
+                    "request_frame_index": request_frame,
+                    "frozen_frame_index": current_frame,
+                    "fresh_frames_after_request": fresh_frame_count,
                     "divider_y_mm": status.get("divider_y_mm"),
                     "arbitrary_piece_count": status.get("arbitrary_piece_count"),
                     "arbitrary_pieces": status.get("arbitrary_pieces"),
@@ -530,11 +685,13 @@ class GantryTaskController:
     def _worker(self) -> None:
         while self.running:
             try:
-                request_id, mode, _source = self.requests.get(timeout=0.2)
+                request_id, mode, _source, request_frame = self.requests.get(
+                    timeout=0.2
+                )
             except queue.Empty:
                 continue
             try:
-                plan = self._wait_for_plan(request_id, mode)
+                plan = self._wait_for_plan(request_id, mode, request_frame)
                 if plan is None:
                     continue
                 with self.lock:
@@ -571,6 +728,7 @@ class GantryTaskController:
                 "error": self.last_error,
                 "active_request_id": self.active_request_id,
                 "active_mode": self.active_mode,
+                "request_vision_frame_index": self.request_vision_frame_index,
                 "frozen_plan": deepcopy(self.frozen_plan),
                 "history": list(self.history),
             }

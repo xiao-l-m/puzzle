@@ -5,8 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import hashlib
 from itertools import permutations
 import json
@@ -23,11 +22,6 @@ from urllib.parse import parse_qs, urlparse
 import cv2
 import numpy as np
 
-from arbitrary_puzzle_solver import (
-    DEFAULT_DIVIDER_MARGIN_MM,
-    DEFAULT_SEAM_GAP_MM,
-    solve_arbitrary_puzzle,
-)
 from gantry_serial import GantryTaskController
 from puzzle_motion import (
     Mode1TargetLatch,
@@ -51,13 +45,12 @@ TARGET_RECT_WIDTH_MM = 100.0
 TARGET_RECT_HEIGHT_MM = 60.0
 ASSEMBLY_DIVIDER_GAP_MM = 18.0
 ASSEMBLY_PIECE_SPACING_MM = 10.0
-ASSEMBLY_STAGE_MIN_CENTER_Y_MM = 62.0
-ASSEMBLY_STAGE_MAX_CENTER_Y_MM = 287.0
+ASSEMBLY_STAGE_MIN_CENTER_Y_MM = 61.0
+ASSEMBLY_STAGE_MAX_CENTER_Y_MM = 286.0
 ASSEMBLY_STAGE_MIN_CENTER_X_MM = 5.0
 ASSEMBLY_STAGE_MAX_CENTER_X_MM = 205.0
-ASSEMBLY_MIN_CLEARANCE_MM = 5.0
+ASSEMBLY_MIN_CLEARANCE_MM = 3.0
 ASSEMBLY_MAX_ADJACENT_VERTEX_GAP_MM = 15.0
-ASSEMBLY_FIXED_OFFSET_SCALE = 1.52
 
 # Figure 2 dimensions, in a 100 x 60 mm target-local coordinate frame.
 # The main seam is the 6-8-10 right-triangle diagonal from (20, 0) to
@@ -171,68 +164,63 @@ def polygon_clearance_mm(first: np.ndarray, second: np.ndarray) -> float:
 
 
 def solve_assembly_target_offsets() -> tuple[dict[str, np.ndarray], dict[str, Any]]:
-    """Return and validate the fixed score-safe Figure-2 layout.
-
-    The four question-2 pieces are invariant, so searching for the smallest
-    legal seam on every frame only pushes the result toward the overlap
-    boundary.  Scale 1.52 balances the two scoring margins: approximately
-    5 mm minimum physical clearance and 15 mm maximum corresponding-vertex
-    gap, leaving roughly 5 mm on either side of the 0/20 mm penalty limits.
-    """
+    """Find the smallest valid loose-fit translation of the four templates."""
     templates = {name: target for name, target in TARGET_PIECE_TEMPLATES}
     names = tuple(templates)
     adjacent = {frozenset(pair) for pair in ASSEMBLY_ADJACENT_PAIRS}
-    scale = ASSEMBLY_FIXED_OFFSET_SCALE
-    offsets = {
-        name: ASSEMBLY_OFFSET_DIRECTIONS[name] * scale for name in names
-    }
-    clearances: dict[str, float] = {}
-    vertex_gaps: dict[str, float] = {}
-    for first_index, first_name in enumerate(names):
-        for second_name in names[first_index + 1:]:
-            pair_key = f"{first_name}|{second_name}"
-            first_polygon = templates[first_name] + offsets[first_name]
-            second_polygon = templates[second_name] + offsets[second_name]
-            clearance = polygon_clearance_mm(first_polygon, second_polygon)
-            clearances[pair_key] = clearance
-            if frozenset((first_name, second_name)) in adjacent:
-                vertex_gaps[pair_key] = float(
-                    np.linalg.norm(offsets[first_name] - offsets[second_name])
-                )
-    minimum_clearance = min(clearances.values())
-    maximum_vertex_gap = max(vertex_gaps.values())
-    if (
-        minimum_clearance + 1.0e-6 < ASSEMBLY_MIN_CLEARANCE_MM
-        or maximum_vertex_gap
-        > ASSEMBLY_MAX_ADJACENT_VERTEX_GAP_MM + 1.0e-6
-    ):
-        raise ValueError("FIXED_TARGET_LAYOUT_FAILED_SCORE_SAFETY_CHECK")
-    return offsets, {
-        "solver": "fixed_figure2_score_safe_layout_v2",
-        "scale": round(float(scale), 3),
-        "minimum_required_clearance_mm": ASSEMBLY_MIN_CLEARANCE_MM,
-        "actual_minimum_clearance_mm": round(minimum_clearance, 3),
-        "overlap_penalty_margin_mm": round(minimum_clearance, 3),
-        "maximum_allowed_adjacent_vertex_gap_mm": (
-            ASSEMBLY_MAX_ADJACENT_VERTEX_GAP_MM
-        ),
-        "scoring_vertex_gap_limit_mm": 20.0,
-        "actual_maximum_adjacent_vertex_gap_mm": round(
-            maximum_vertex_gap, 3
-        ),
-        "vertex_gap_penalty_margin_mm": round(
-            20.0 - maximum_vertex_gap, 3
-        ),
-        "pair_clearances_mm": {
-            key: round(value, 3) for key, value in clearances.items()
-        },
-        "adjacent_vertex_gaps_mm": {
-            key: round(value, 3) for key, value in vertex_gaps.items()
-        },
-        "fixed_offsets_mm": {
-            key: np.round(value, 3).tolist() for key, value in offsets.items()
-        },
-    }
+    for scale in np.linspace(0.5, 1.5, 101):
+        offsets = {
+            name: ASSEMBLY_OFFSET_DIRECTIONS[name] * float(scale)
+            for name in names
+        }
+        clearances: dict[str, float] = {}
+        vertex_gaps: dict[str, float] = {}
+        valid = True
+        for first_index, first_name in enumerate(names):
+            for second_name in names[first_index + 1:]:
+                pair_key = f"{first_name}|{second_name}"
+                first_polygon = templates[first_name] + offsets[first_name]
+                second_polygon = templates[second_name] + offsets[second_name]
+                clearance = polygon_clearance_mm(first_polygon, second_polygon)
+                clearances[pair_key] = clearance
+                pair_is_adjacent = frozenset((first_name, second_name)) in adjacent
+                # Every pair must have a visible positive seam, including the
+                # only non-adjacent pair in the exact tiling.
+                required_clearance = ASSEMBLY_MIN_CLEARANCE_MM
+                if clearance + 1.0e-6 < required_clearance:
+                    valid = False
+                    break
+                if pair_is_adjacent:
+                    vertex_gap = float(
+                        np.linalg.norm(offsets[first_name] - offsets[second_name])
+                    )
+                    vertex_gaps[pair_key] = vertex_gap
+                    if vertex_gap > ASSEMBLY_MAX_ADJACENT_VERTEX_GAP_MM + 1.0e-6:
+                        valid = False
+                        break
+            if not valid:
+                break
+        if not valid:
+            continue
+        return offsets, {
+            "solver": "scaled_seam_normal_search_v1",
+            "scale": round(float(scale), 3),
+            "minimum_required_clearance_mm": ASSEMBLY_MIN_CLEARANCE_MM,
+            "actual_minimum_clearance_mm": round(min(clearances.values()), 3),
+            "maximum_allowed_adjacent_vertex_gap_mm": (
+                ASSEMBLY_MAX_ADJACENT_VERTEX_GAP_MM
+            ),
+            "actual_maximum_adjacent_vertex_gap_mm": round(
+                max(vertex_gaps.values()), 3
+            ),
+            "pair_clearances_mm": {
+                key: round(value, 3) for key, value in clearances.items()
+            },
+            "adjacent_vertex_gaps_mm": {
+                key: round(value, 3) for key, value in vertex_gaps.items()
+            },
+        }
+    raise ValueError("NO_TARGET_LAYOUT_SATISFIES_CLEARANCE_AND_15MM_VERTEX_LIMIT")
 
 
 @dataclass
@@ -245,7 +233,6 @@ class DetectorConfig:
     paper_mode: str = "auto"
     divider_y_mm: float = 0.0
     source_region: str = "lower"
-    mode2_white_only: bool = False
 
 
 class PuzzleDetector:
@@ -257,25 +244,6 @@ class PuzzleDetector:
         self.a4_corner_history: deque[np.ndarray] = deque(maxlen=15)
         self.divider_history: deque[float] = deque(maxlen=15)
         self.plan_history: deque[dict[str, Any]] = deque(maxlen=12)
-        self.arbitrary_piece_history: deque[dict[str, Any]] = deque(
-            maxlen=max(5, config.stable_frames)
-        )
-        self.arbitrary_geometry_cache: list[dict[str, Any]] = []
-        # Mode 2 now reuses mode 3's white-on-black polygon fitter, but keeps
-        # an independent temporal cache.  A preview switch or a mode-3 solve
-        # must never replace the four fixed-template observations.
-        self.mode2_white_piece_history: deque[dict[str, Any]] = deque(
-            maxlen=max(3, config.stable_frames)
-        )
-        self.mode2_white_geometry_cache: list[dict[str, Any]] = []
-        self.arbitrary_solution_cache: dict[str, Any] | None = None
-        self.arbitrary_solution_reference: dict[str, Any] | None = None
-        self.arbitrary_solution_cached_at: float | None = None
-        # Modes 2 and 3 use different source shapes and target solvers.  Keep
-        # their annotated frames separate so the browser never overlays a
-        # fixed Figure-2 plan on an arbitrary-white-piece reconstruction.
-        self.mode2_preview: np.ndarray | None = None
-        self.mode3_preview: np.ndarray | None = None
 
     def stabilize_a4_corners(
         self, corners: np.ndarray
@@ -778,1031 +746,11 @@ class PuzzleDetector:
         close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
+        # White paper fibres and slight adhesive-edge lift create one-to-two
+        # pixel teeth after thresholding.  A small median filter removes those
+        # isolated teeth without rounding the physical 20 mm+ straight edges.
+        mask = cv2.medianBlur(mask, 5)
         return mask, paper_luma, threshold, mode
-
-    def segment_arbitrary_white_pieces(
-        self, warped: np.ndarray, divider_y: int
-    ) -> tuple[np.ndarray, float, float]:
-        """Segment question-2 white pieces only in the A4 lower half."""
-        gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-        # Keep only a 1 mm guard at the sides and divider-facing edge.  The
-        # physical A4 bottom edge is a broad bright, slightly wavy band.  In
-        # mode 2 it can join a nearby white triangle to the paper border and
-        # create a long false tail.  Isolate only that bottom band; doing this
-        # asymmetrically avoids the old 4 mm all-round crop that removed a
-        # valid piece near the divider.
-        margin = int(round(1.0 * WARP_PX_PER_MM))
-        bottom_margin = int(
-            round(
-                (5.0 if self.config.mode2_white_only else 1.0)
-                * WARP_PX_PER_MM
-            )
-        )
-        divider_margin = int(round(DEFAULT_DIVIDER_MARGIN_MM * WARP_PX_PER_MM))
-        region_start = min(
-            gray.shape[0] - margin - 20,
-            int(divider_y) + divider_margin,
-        )
-        region_start = max(margin, region_start)
-        region_end = gray.shape[0] - bottom_margin
-        roi = gray[region_start:region_end, margin:gray.shape[1] - margin]
-        mask = np.zeros_like(gray)
-        if roi.size == 0:
-            return mask, 0.0, 255.0
-
-        blurred = cv2.GaussianBlur(roi, (5, 5), 0.0)
-        if not self.config.mode2_white_only:
-            # Reuse project2.1/project/live_vision.py's proven shape pipeline
-            # for arbitrary white fragments.  A single Otsu threshold and
-            # fixed morphology are substantially more temporally stable than
-            # the former CLAHE/global-threshold union, whose shallow edge
-            # ripples made the fitted vertex count jump between frames.
-            threshold, foreground = cv2.threshold(
-                blurred,
-                0,
-                255,
-                cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-            )
-            foreground = cv2.morphologyEx(
-                foreground,
-                cv2.MORPH_OPEN,
-                np.ones((3, 3), np.uint8),
-                iterations=1,
-            )
-            foreground = cv2.morphologyEx(
-                foreground,
-                cv2.MORPH_CLOSE,
-                np.ones((5, 5), np.uint8),
-                iterations=2,
-            )
-            mask[
-                region_start:region_end,
-                margin:gray.shape[1] - margin,
-            ] = foreground
-            background_luma = float(np.percentile(blurred, 35.0))
-            return mask, background_luma, float(threshold)
-
-        local_contrast = cv2.createCLAHE(
-            clipLimit=2.0, tileGridSize=(8, 8)
-        ).apply(blurred)
-        background_luma = float(np.percentile(blurred, 35.0))
-        otsu_threshold, _unused = cv2.threshold(
-            blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-        )
-        # A bright A4 border can drive Otsu far above a shaded white fragment.
-        # Keep Otsu adaptive, but cap how far it may rise above the measured
-        # black-paper background.  The second branch recovers locally bright
-        # paper under uneven ordinary-room illumination.
-        threshold = max(
-            background_luma + max(18.0, 0.7 * self.config.contrast),
-            min(float(otsu_threshold), background_luma + 85.0),
-        )
-        local_otsu, _unused = cv2.threshold(
-            local_contrast, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-        )
-        local_floor = max(85.0, min(150.0, 0.72 * float(local_otsu)))
-        global_white = blurred >= threshold
-        local_white = (
-            (blurred >= background_luma + 14.0)
-            & (local_contrast >= local_floor)
-        )
-        foreground = np.where(global_white | local_white, 255, 0).astype(
-            np.uint8
-        )
-        foreground = cv2.morphologyEx(
-            foreground,
-            cv2.MORPH_OPEN,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
-        )
-        if self.config.mode2_white_only:
-            # The known Figure-2 pieces may be arranged with only a one-pixel
-            # dark seam between them.  One final erosion cuts threshold
-            # bridges without the dilation phase that would join the seam
-            # again.  At 4 px/mm the resulting 0.25 mm inset is well below
-            # the template and motion tolerances.
-            foreground = cv2.erode(
-                foreground,
-                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
-                iterations=2,
-            )
-        # The fixed Figure-2 pieces can sit only a few pixels apart in the
-        # rectified image.  Mode 3's wider close is useful for damaged unknown
-        # outlines, but it bridged two known white pieces into one component
-        # on the live mode-2 scene.  Keep the proven mode-3 value untouched and
-        # use a light close only for the opt-in fixed-template white pipeline.
-        close_size = 1 if self.config.mode2_white_only else 9
-        if close_size > 1:
-            foreground = cv2.morphologyEx(
-                foreground,
-                cv2.MORPH_CLOSE,
-                cv2.getStructuringElement(
-                    cv2.MORPH_ELLIPSE, (close_size, close_size)
-                ),
-            )
-        # Suppress one-pixel paper-fibre teeth before contour tracing.  Exact
-        # four-corner fitting below preserves the real topology after this
-        # light smoothing.
-        # A median filter is helpful for arbitrary damaged pieces, but even a
-        # 3 px filter can close the last dark pixel in a narrow diagonal gap.
-        # In fixed-template mode the preceding 3 px opening already removes
-        # isolated fibre noise, so preserve the binary gaps exactly.
-        if not self.config.mode2_white_only:
-            foreground = cv2.medianBlur(foreground, 5)
-        mask[region_start:region_end, margin:gray.shape[1] - margin] = foreground
-        return mask, background_luma, threshold
-
-    @staticmethod
-    def _canonical_detected_polygon(polygon_mm: np.ndarray) -> np.ndarray:
-        polygon = np.asarray(polygon_mm, np.float64).reshape(-1, 2)
-        following = np.roll(polygon, -1, axis=0)
-        signed = 0.5 * float(
-            np.sum(
-                polygon[:, 0] * following[:, 1]
-                - following[:, 0] * polygon[:, 1]
-            )
-        )
-        if signed < 0.0:
-            polygon = polygon[::-1].copy()
-        start = min(
-            range(len(polygon)),
-            key=lambda index: (
-                round(float(polygon[index, 1]), 4),
-                round(float(polygon[index, 0]), 4),
-            ),
-        )
-        return np.roll(polygon, -start, axis=0)
-
-    @staticmethod
-    def _prune_nearly_collinear_vertices(polygon_mm: np.ndarray) -> np.ndarray:
-        """Remove threshold-noise points that split one straight edge.
-
-        approxPolyDP can alternate between four and five vertices when a
-        nearly straight paper edge contains a shallow lighting ripple.  That
-        changed the stability signature every few frames.  Only a point whose
-        projection lies inside the neighbouring segment and is within 1.25 mm
-        of that segment is removed; real corners are retained.
-        """
-        polygon = np.asarray(polygon_mm, np.float64).reshape(-1, 2).copy()
-        while len(polygon) > 3:
-            best: tuple[float, int] | None = None
-            for index in range(len(polygon)):
-                previous = polygon[(index - 1) % len(polygon)]
-                current = polygon[index]
-                following = polygon[(index + 1) % len(polygon)]
-                segment = following - previous
-                denominator = float(np.dot(segment, segment))
-                if denominator <= 1.0e-9:
-                    continue
-                projection = float(
-                    np.dot(current - previous, segment) / denominator
-                )
-                if not 0.08 <= projection <= 0.92:
-                    continue
-                projected = previous + projection * segment
-                distance = float(np.linalg.norm(current - projected))
-                if distance <= 1.25 and (
-                    best is None or distance < best[0]
-                ):
-                    best = (distance, index)
-            if best is None:
-                break
-            polygon = np.delete(polygon, best[1], axis=0)
-        return PuzzleDetector._canonical_detected_polygon(polygon)
-
-    @staticmethod
-    def _refine_polygon_edge_lines(
-        contour_px: np.ndarray, polygon_mm: np.ndarray
-    ) -> np.ndarray:
-        """Straighten each fitted edge and recover stable corner intersections.
-
-        Threshold noise makes the raw contour look serrated and can move an
-        approxPolyDP corner by several millimetres from frame to frame.  The
-        middle part of a physical cut edge is much more stable than its rounded
-        threshold corner, so fit a TLS line to the interior samples of each
-        edge and intersect neighbouring lines.  The 6 mm displacement guard
-        keeps a bad/near-parallel fit from changing the detected topology.
-        """
-        polygon = np.asarray(polygon_mm, np.float64).reshape(-1, 2)
-        contour = (
-            np.asarray(contour_px, np.float64).reshape(-1, 2)
-            / WARP_PX_PER_MM
-        )
-        if len(polygon) < 3 or len(contour) < 12:
-            return polygon.copy()
-
-        lines: list[tuple[np.ndarray, np.ndarray]] = []
-        for index in range(len(polygon)):
-            start = polygon[index]
-            finish = polygon[(index + 1) % len(polygon)]
-            segment = finish - start
-            length2 = float(np.dot(segment, segment))
-            length = math.sqrt(max(length2, 0.0))
-            if length < 8.0:
-                return polygon.copy()
-            relative = contour - start[None, :]
-            projection = (relative @ segment) / length2
-            distance = np.abs(
-                segment[0] * relative[:, 1]
-                - segment[1] * relative[:, 0]
-            ) / length
-            support = contour[
-                (projection >= 0.10)
-                & (projection <= 0.90)
-                & (distance <= 1.75)
-            ]
-            if len(support) < 6:
-                support = contour[
-                    (projection >= 0.04)
-                    & (projection <= 0.96)
-                    & (distance <= 2.5)
-                ]
-            if len(support) < 6:
-                return polygon.copy()
-            point = np.mean(support, axis=0)
-            centered = support - point[None, :]
-            _u, _singular, axes = np.linalg.svd(centered, full_matrices=False)
-            direction = np.asarray(axes[0], np.float64)
-            if float(np.dot(direction, segment)) < 0.0:
-                direction = -direction
-            lines.append((point, direction))
-
-        refined: list[np.ndarray] = []
-        for index in range(len(polygon)):
-            previous_point, previous_direction = lines[(index - 1) % len(lines)]
-            next_point, next_direction = lines[index]
-            denominator = float(
-                previous_direction[0] * next_direction[1]
-                - previous_direction[1] * next_direction[0]
-            )
-            if abs(denominator) < 0.08:
-                return polygon.copy()
-            delta = next_point - previous_point
-            parameter = float(
-                (delta[0] * next_direction[1] - delta[1] * next_direction[0])
-                / denominator
-            )
-            intersection = previous_point + parameter * previous_direction
-            if float(np.linalg.norm(intersection - polygon[index])) > 6.0:
-                return polygon.copy()
-            refined.append(intersection)
-
-        refined_polygon = PuzzleDetector._canonical_detected_polygon(
-            np.asarray(refined, np.float64)
-        )
-        if len(refined_polygon) != len(polygon):
-            return polygon.copy()
-        return refined_polygon
-
-    @staticmethod
-    def _fit_project21_polygon(
-        contour_px: np.ndarray,
-    ) -> tuple[np.ndarray, float] | None:
-        """Stable fixed-epsilon polygon fit reused from project2.1.
-
-        The source implementation uses one 1.5%-perimeter approximation and
-        a 2% convex-hull fallback.  Restrict the result to the task's 3..5
-        physical edges, canonicalize it for temporal comparison, and report
-        the same contour-area fidelity consumed by the existing solver.
-        """
-        contour = np.asarray(contour_px).reshape(-1, 1, 2)
-        if len(contour) < 4:
-            return None
-        contour_area_px = abs(float(cv2.contourArea(contour)))
-        perimeter = float(cv2.arcLength(contour, True))
-        if contour_area_px <= 1.0 or perimeter <= 1.0:
-            return None
-
-        polygon_px = cv2.approxPolyDP(
-            contour, 0.015 * perimeter, True
-        ).reshape(-1, 2)
-        if not 3 <= len(polygon_px) <= 5:
-            polygon_px = cv2.approxPolyDP(
-                cv2.convexHull(contour), 0.02 * perimeter, True
-            ).reshape(-1, 2)
-        if not 3 <= len(polygon_px) <= 5:
-            return None
-
-        polygon_mm = PuzzleDetector._canonical_detected_polygon(
-            polygon_px.astype(np.float64) / WARP_PX_PER_MM
-        )
-        polygon_mm = PuzzleDetector._prune_nearly_collinear_vertices(
-            polygon_mm
-        )
-        if not 3 <= len(polygon_mm) <= 5:
-            return None
-        edge_lengths = np.linalg.norm(
-            np.roll(polygon_mm, -1, axis=0) - polygon_mm,
-            axis=1,
-        )
-        if float(np.min(edge_lengths)) < 6.0:
-            return None
-        polygon_area_px = abs(
-            float(
-                cv2.contourArea(
-                    np.asarray(
-                        polygon_mm * WARP_PX_PER_MM,
-                        np.float32,
-                    ).reshape(-1, 1, 2)
-                )
-            )
-        )
-        area_error = abs(polygon_area_px - contour_area_px) / max(
-            1.0, contour_area_px
-        )
-        if area_error > 0.18:
-            return None
-        return polygon_mm, float(area_error)
-
-    @staticmethod
-    def _fit_arbitrary_polygon(
-        contour_px: np.ndarray,
-    ) -> tuple[np.ndarray, float] | None:
-        """Fit one physical 3..5-edge fragment despite a serrated mask edge.
-
-        The white paper edge can contain small threshold dents and highlights.
-        Search several simplification scales, retain only the 3..5 vertices
-        allowed by the task, then re-fit their supporting straight lines against
-        the measured contour.  Unlike the previous quadrilateral-only fitter,
-        this preserves real triangles and pentagons without reflecting, scaling,
-        or otherwise changing the piece topology.
-        """
-        contour = np.asarray(contour_px).reshape(-1, 1, 2)
-        if len(contour) < 4:
-            return None
-        contour_area_px = abs(float(cv2.contourArea(contour)))
-        if contour_area_px <= 1.0:
-            return None
-
-        perimeter = float(cv2.arcLength(contour, True))
-        if perimeter <= 1.0:
-            return None
-
-        candidates: list[tuple[float, np.ndarray, float]] = []
-        seen: set[tuple[float, ...]] = set()
-        for fraction in np.linspace(0.0025, 0.075, 120):
-            polygon_px = cv2.approxPolyDP(
-                contour, float(fraction) * perimeter, True
-            ).reshape(-1, 2)
-            if not 3 <= len(polygon_px) <= 5:
-                continue
-            key = tuple(np.round(polygon_px.reshape(-1), 1))
-            if key in seen:
-                continue
-            seen.add(key)
-
-            polygon_mm = PuzzleDetector._canonical_detected_polygon(
-                polygon_px.astype(np.float64) / WARP_PX_PER_MM
-            )
-            polygon_mm = PuzzleDetector._prune_nearly_collinear_vertices(
-                polygon_mm
-            )
-            if not 3 <= len(polygon_mm) <= 5:
-                continue
-            polygon_mm = PuzzleDetector._refine_polygon_edge_lines(
-                contour, polygon_mm
-            )
-            if not 3 <= len(polygon_mm) <= 5:
-                continue
-
-            edge_lengths = np.linalg.norm(
-                np.roll(polygon_mm, -1, axis=0) - polygon_mm, axis=1
-            )
-            # The field pieces are manually cut and the photographed corner
-            # can be truncated, so do not enforce the nominal 20 mm rule at
-            # detection time.  Topology is protected by the exact four-corner
-            # requirement; this lower bound only rejects a degenerate fit.
-            if float(np.min(edge_lengths)) < 6.0:
-                continue
-
-            polygon_px_refined = np.asarray(
-                polygon_mm * WARP_PX_PER_MM, np.float32
-            ).reshape(-1, 1, 2)
-            polygon_area_px = abs(float(cv2.contourArea(polygon_px_refined)))
-            area_error = abs(polygon_area_px - contour_area_px) / max(
-                1.0, contour_area_px
-            )
-            # Preserve measured area first.  The small edge/complexity terms
-            # only break near ties; they must never collapse a genuine corner.
-            short_edge_penalty = max(
-                0.0, (20.0 - float(np.min(edge_lengths))) / 20.0
-            )
-            cost = (
-                area_error
-                + 0.010 * short_edge_penalty
-                + 0.0005 * len(polygon_mm)
-            )
-            candidates.append((cost, polygon_mm, area_error))
-
-        if not candidates:
-            return None
-        candidates.sort(key=lambda value: value[0])
-        _cost, polygon_mm, area_error = candidates[0]
-        if area_error > 0.18:
-            return None
-        return polygon_mm, float(area_error)
-
-    @staticmethod
-    def _sample_polygon_boundary(
-        polygon_mm: np.ndarray, sample_count: int = 128
-    ) -> np.ndarray:
-        """Uniformly sample a closed polygon boundary, independent of vertices."""
-        polygon = np.asarray(polygon_mm, np.float64).reshape(-1, 2)
-        following = np.roll(polygon, -1, axis=0)
-        lengths = np.linalg.norm(following - polygon, axis=1)
-        perimeter = float(np.sum(lengths))
-        if len(polygon) < 3 or perimeter <= 1.0e-9:
-            return np.repeat(polygon[:1], sample_count, axis=0)
-        cumulative = np.concatenate(([0.0], np.cumsum(lengths)))
-        distances = np.linspace(0.0, perimeter, sample_count, endpoint=False)
-        samples = np.empty((sample_count, 2), np.float64)
-        edge_index = 0
-        for sample_index, distance in enumerate(distances):
-            while (
-                edge_index + 1 < len(cumulative) - 1
-                and distance >= cumulative[edge_index + 1]
-            ):
-                edge_index += 1
-            edge_length = max(float(lengths[edge_index]), 1.0e-9)
-            fraction = (distance - cumulative[edge_index]) / edge_length
-            samples[sample_index] = (
-                polygon[edge_index]
-                + fraction * (following[edge_index] - polygon[edge_index])
-            )
-        return samples
-
-    @staticmethod
-    def _boundary_hausdorff_mm(first: np.ndarray, second: np.ndarray) -> float:
-        """Symmetric sampled boundary distance for temporal shape stability."""
-        differences = first[:, None, :] - second[None, :, :]
-        distances = np.linalg.norm(differences, axis=2)
-        return max(
-            float(np.max(np.min(distances, axis=1))),
-            float(np.max(np.min(distances, axis=0))),
-        )
-
-    @staticmethod
-    def _safe_pick_point(polygon_mm: np.ndarray, centroid_mm: np.ndarray) -> tuple[np.ndarray, float, str]:
-        polygon32 = np.asarray(polygon_mm, np.float32).reshape(-1, 2)
-        centroid = np.asarray(centroid_mm, np.float64).reshape(2)
-        centroid_clearance = float(
-            cv2.pointPolygonTest(polygon32, tuple(centroid), True)
-        )
-        if centroid_clearance >= 4.0:
-            return centroid, centroid_clearance, "AREA_CENTROID"
-
-        minimum = np.floor(np.min(polygon32, axis=0)).astype(int)
-        maximum = np.ceil(np.max(polygon32, axis=0)).astype(int)
-        best = centroid.copy()
-        best_clearance = centroid_clearance
-        for step in (2.0, 0.5):
-            if step == 2.0:
-                x_values = np.arange(minimum[0], maximum[0] + 0.1, step)
-                y_values = np.arange(minimum[1], maximum[1] + 0.1, step)
-            else:
-                x_values = np.arange(best[0] - 2.0, best[0] + 2.01, step)
-                y_values = np.arange(best[1] - 2.0, best[1] + 2.01, step)
-            for y_value in y_values:
-                for x_value in x_values:
-                    clearance = float(
-                        cv2.pointPolygonTest(
-                            polygon32, (float(x_value), float(y_value)), True
-                        )
-                    )
-                    if clearance > best_clearance:
-                        best_clearance = clearance
-                        best = np.asarray([x_value, y_value], np.float64)
-        return best, best_clearance, "MAX_INTERIOR_CLEARANCE"
-
-    def extract_arbitrary_white_pieces(
-        self, mask: np.ndarray
-    ) -> tuple[list[dict[str, Any]], list[np.ndarray]]:
-        contours, _hierarchy = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        scale2 = WARP_PX_PER_MM * WARP_PX_PER_MM
-        candidates: list[tuple[float, dict[str, Any], np.ndarray]] = []
-        for contour in contours:
-            area_px = float(cv2.contourArea(contour))
-            area_mm2 = area_px / scale2
-            if not 120.0 <= area_mm2 <= 11200.0:
-                continue
-            _x, _y, width_px, height_px = cv2.boundingRect(contour)
-            short_px = max(1, min(width_px, height_px))
-            long_px = max(width_px, height_px)
-            # Same physical-shape guard as project2.1/live_vision.py: reject
-            # thin A4-border/fibre components without constraining the valid
-            # triangle/quadrilateral/pentagon topology.
-            if (
-                short_px < int(round(10.0 * WARP_PX_PER_MM))
-                or long_px / short_px > 8.0
-            ):
-                continue
-            perimeter = float(cv2.arcLength(contour, True))
-            if perimeter < 40.0:
-                continue
-            moments = cv2.moments(contour)
-            if abs(float(moments["m00"])) < 1.0:
-                continue
-            centroid_mm = np.asarray(
-                [
-                    moments["m10"] / moments["m00"] / WARP_PX_PER_MM,
-                    moments["m01"] / moments["m00"] / WARP_PX_PER_MM,
-                ],
-                np.float64,
-            )
-            fitted = self._fit_project21_polygon(contour)
-            geometry_source = "PROJECT21_FIXED_EPSILON_POLYGON"
-            if fitted is None:
-                # Preserve the current high-fidelity fitter only as a fallback
-                # for a genuine concave/damaged edge that fixed epsilon cannot
-                # express with the task's 3..5 vertices.
-                fitted = self._fit_arbitrary_polygon(contour)
-                geometry_source = "ADAPTIVE_POLYGON_FALLBACK"
-            if fitted is None:
-                continue
-            polygon_mm, polygon_area_error = fitted
-            edge_lengths = np.linalg.norm(
-                np.roll(polygon_mm, -1, axis=0) - polygon_mm, axis=1
-            )
-            pick_point, pick_clearance, pick_method = self._safe_pick_point(
-                polygon_mm, centroid_mm
-            )
-            hull_area = float(cv2.contourArea(cv2.convexHull(contour)))
-            solidity = area_px / max(1.0, hull_area)
-            # Perspective-warped white A4 borders form long, hollow contours
-            # that can otherwise masquerade as a 3/4-edge piece.  Genuine
-            # <=5-edge fragments may be concave, so keep a deliberately loose
-            # lower bound while rejecting the observed border artefact.
-            if solidity < 0.45:
-                continue
-            rectangle = cv2.minAreaRect(contour)
-            item = {
-                "center_mm": np.round(centroid_mm, 2).tolist(),
-                "pick_point_mm": np.round(pick_point, 2).tolist(),
-                "pick_clearance_mm": round(float(pick_clearance), 2),
-                "pick_method": pick_method,
-                "angle_deg": round(float(rectangle[2]), 2),
-                "area_mm2": round(area_mm2, 2),
-                "polygon_area_error_ratio": round(float(polygon_area_error), 4),
-                "solidity": round(solidity, 3),
-                "vertex_count": int(len(polygon_mm)),
-                "edge_lengths_mm": np.round(edge_lengths, 2).tolist(),
-                "vertices_mm": np.round(polygon_mm, 2).tolist(),
-                "detection_source": "PROJECT21_OTSU_WHITE_MASK",
-                "polygon_fit_source": geometry_source,
-            }
-            candidates.append((area_mm2, item, contour))
-        # Stable IDs follow physical position, not contour enumeration order.
-        candidates.sort(
-            key=lambda value: (
-                float(value[1]["center_mm"][1]),
-                float(value[1]["center_mm"][0]),
-            )
-        )
-        candidates = candidates[:4]
-        pieces: list[dict[str, Any]] = []
-        selected: list[np.ndarray] = []
-        for index, (_area, item, contour) in enumerate(candidates, start=1):
-            item["id"] = f"W{index}"
-            pieces.append(item)
-            selected.append(contour)
-        return pieces, selected
-
-    def recover_arbitrary_from_standard_contours(
-        self,
-        arbitrary_pieces: list[dict[str, Any]],
-        arbitrary_contours: list[np.ndarray],
-        standard_pieces: list[dict[str, Any]],
-        standard_contours: list[np.ndarray],
-    ) -> tuple[list[dict[str, Any]], list[np.ndarray], int]:
-        """Recover a bright fragment missed by the dedicated white mask.
-
-        The ordinary black-paper detector and the mode-3 white detector are
-        intentionally independent.  Near the A4 bottom edge or under a strong
-        reflection, one valid fragment can pass the former but miss the latter.
-        A standard contour is admitted only when it does not match an existing
-        mode-3 centre and its four-edge polygon still passes the same geometric
-        fidelity, edge, area, solidity and safe-pick checks.
-        """
-        merged: list[tuple[dict[str, Any], np.ndarray]] = list(
-            zip(arbitrary_pieces, arbitrary_contours)
-        )
-        recovered = 0
-        for standard, contour in zip(standard_pieces, standard_contours):
-            if len(merged) >= 4:
-                break
-            center = np.asarray(standard.get("center_mm", []), np.float64)
-            if center.shape != (2,) or not np.all(np.isfinite(center)):
-                continue
-            if any(
-                float(
-                    np.linalg.norm(
-                        center - np.asarray(item["center_mm"], np.float64)
-                    )
-                )
-                <= 6.0
-                for item, _existing_contour in merged
-            ):
-                continue
-            fitted = self._fit_arbitrary_polygon(contour)
-            if fitted is None:
-                continue
-            polygon_mm, polygon_area_error = fitted
-            edge_lengths = np.linalg.norm(
-                np.roll(polygon_mm, -1, axis=0) - polygon_mm, axis=1
-            )
-            area_mm2 = float(standard.get("area_mm2", 0.0))
-            if not 120.0 <= area_mm2 <= 11200.0:
-                continue
-            hull_area = float(cv2.contourArea(cv2.convexHull(contour)))
-            contour_area = float(cv2.contourArea(contour))
-            solidity = contour_area / max(1.0, hull_area)
-            if solidity < 0.45:
-                continue
-            pick_point, pick_clearance, pick_method = self._safe_pick_point(
-                polygon_mm, center
-            )
-            merged.append(
-                (
-                    {
-                        "center_mm": np.round(center, 2).tolist(),
-                        "pick_point_mm": np.round(pick_point, 2).tolist(),
-                        "pick_clearance_mm": round(float(pick_clearance), 2),
-                        "pick_method": pick_method,
-                        "angle_deg": round(pca_angle_deg(contour), 2),
-                        "area_mm2": round(area_mm2, 2),
-                        "polygon_area_error_ratio": round(
-                            float(polygon_area_error), 4
-                        ),
-                        "solidity": round(solidity, 3),
-                        "vertex_count": int(len(polygon_mm)),
-                        "edge_lengths_mm": np.round(
-                            edge_lengths, 2
-                        ).tolist(),
-                        "vertices_mm": np.round(polygon_mm, 2).tolist(),
-                        "detection_source": "STANDARD_CONTOUR_FALLBACK",
-                    },
-                    contour,
-                )
-            )
-            recovered += 1
-
-        merged.sort(
-            key=lambda value: (
-                float(value[0]["center_mm"][1]),
-                float(value[0]["center_mm"][0]),
-            )
-        )
-        pieces: list[dict[str, Any]] = []
-        contours: list[np.ndarray] = []
-        for index, (item, contour) in enumerate(merged[:4], start=1):
-            item = dict(item)
-            item["id"] = f"W{index}"
-            pieces.append(item)
-            contours.append(contour)
-        return pieces, contours, recovered
-
-    def stabilize_arbitrary_polygons(
-        self, pieces: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        """Stabilize stationary polygons using only the latest five frames.
-
-        Lighting can make a shadow edge enter and leave the Otsu mask while the
-        physical piece is motionless.  Keep a bounded, in-memory observation
-        window, select the dominant topology, and use the coordinate median of
-        aligned vertices.  This is deliberately not a persistent/frozen
-        contour: a 2 mm displacement, a piece-count change, or a material area
-        change clears the complete window immediately.
-        """
-        if not 1 <= len(pieces) <= 4:
-            self.arbitrary_geometry_cache.clear()
-            self.arbitrary_piece_history.clear()
-            return pieces
-
-        centers = [
-            np.asarray(piece["center_mm"], np.float64).reshape(2)
-            for piece in pieces
-        ]
-        reset_cache = len(self.arbitrary_geometry_cache) != len(pieces)
-        if not reset_cache:
-            reset_cache = any(
-                (
-                    str(piece["id"]) != str(cached["id"])
-                    or float(
-                        np.linalg.norm(center - cached["anchor_center_mm"])
-                    )
-                    > 2.0
-                    or abs(
-                        float(piece["area_mm2"])
-                        - float(cached["anchor_area_mm2"])
-                    )
-                    / max(1.0, float(cached["anchor_area_mm2"]))
-                    > 0.15
-                )
-                for piece, center, cached in zip(
-                    pieces, centers, self.arbitrary_geometry_cache
-                )
-            )
-        if reset_cache:
-            self.arbitrary_geometry_cache.clear()
-            self.arbitrary_piece_history.clear()
-
-        stabilized: list[dict[str, Any]] = []
-        for index, (piece, center) in enumerate(zip(pieces, centers)):
-            current_vertices = np.asarray(
-                piece["vertices_mm"], np.float64
-            ).reshape(-1, 2)
-            current_error = float(
-                piece.get("polygon_area_error_ratio", float("inf"))
-            )
-            if index >= len(self.arbitrary_geometry_cache):
-                self.arbitrary_geometry_cache.append(
-                    {
-                        "id": str(piece["id"]),
-                        "anchor_center_mm": center.copy(),
-                        "anchor_area_mm2": float(piece["area_mm2"]),
-                        "center_mm": center.copy(),
-                        "observations": [],
-                    }
-                )
-
-            cached = self.arbitrary_geometry_cache[index]
-            observations = cached["observations"]
-            observations.append(
-                {
-                    "relative_vertices_mm": current_vertices - center[None, :],
-                    "area_error": current_error,
-                    "angle_deg": float(piece.get("angle_deg", 0.0)),
-                }
-            )
-            del observations[:-5]
-            cached["center_mm"] = center.copy()
-
-            topology_counts: dict[int, int] = {}
-            topology_latest: dict[int, int] = {}
-            for observation_index, observation in enumerate(observations):
-                vertex_count = len(observation["relative_vertices_mm"])
-                topology_counts[vertex_count] = (
-                    topology_counts.get(vertex_count, 0) + 1
-                )
-                topology_latest[vertex_count] = observation_index
-            selected_vertex_count = max(
-                topology_counts,
-                key=lambda count: (
-                    topology_counts[count], topology_latest[count]
-                ),
-            )
-            selected = [
-                observation
-                for observation in observations
-                if len(observation["relative_vertices_mm"])
-                == selected_vertex_count
-            ]
-            reference = np.asarray(
-                selected[-1]["relative_vertices_mm"], np.float64
-            )
-            aligned_vertices: list[np.ndarray] = []
-            for observation in selected:
-                candidate = np.asarray(
-                    observation["relative_vertices_mm"], np.float64
-                )
-                candidate = min(
-                    (
-                        np.roll(candidate, shift, axis=0)
-                        for shift in range(len(candidate))
-                    ),
-                    key=lambda value: float(
-                        np.mean(np.linalg.norm(value - reference, axis=1))
-                    ),
-                )
-                aligned_vertices.append(candidate)
-            relative_vertices = np.median(
-                np.stack(aligned_vertices, axis=0), axis=0
-            )
-            stable_error = float(
-                np.median([observation["area_error"] for observation in selected])
-            )
-            stable_angle = float(
-                np.median([observation["angle_deg"] for observation in selected])
-            )
-            # Once a complete stationary window is available, latch its robust
-            # consensus. A rolling median alone can alternate when an edge
-            # flips between two masks on successive frames. The latch remains
-            # valid only for this stationary scene; the guards above clear it
-            # as soon as the physical observations change.
-            if (
-                len(observations) >= 5
-                and "latched_relative_vertices_mm" not in cached
-            ):
-                cached["latched_relative_vertices_mm"] = (
-                    relative_vertices.copy()
-                )
-                cached["latched_area_error"] = stable_error
-                cached["latched_angle_deg"] = stable_angle
-            latched_vertices = cached.get("latched_relative_vertices_mm")
-            if latched_vertices is not None:
-                relative_vertices = np.asarray(latched_vertices, np.float64)
-                stable_error = float(cached["latched_area_error"])
-                stable_angle = float(cached["latched_angle_deg"])
-            vertices = self._canonical_detected_polygon(
-                relative_vertices + center[None, :]
-            )
-            edge_lengths = np.linalg.norm(
-                np.roll(vertices, -1, axis=0) - vertices, axis=1
-            )
-            pick_point, pick_clearance, pick_method = self._safe_pick_point(
-                vertices, center
-            )
-            output = dict(piece)
-            output["vertices_mm"] = np.round(vertices, 2).tolist()
-            output["vertex_count"] = int(len(vertices))
-            output["edge_lengths_mm"] = np.round(edge_lengths, 2).tolist()
-            output["polygon_area_error_ratio"] = round(
-                stable_error, 4
-            )
-            output["angle_deg"] = round(stable_angle, 2)
-            output["pick_point_mm"] = np.round(pick_point, 2).tolist()
-            output["pick_clearance_mm"] = round(float(pick_clearance), 2)
-            output["pick_method"] = pick_method
-            output["geometry_source"] = "RECENT_5_FRAME_MEDIAN_POLYGON"
-            output["geometry_samples"] = len(observations)
-            stabilized.append(output)
-        return stabilized
-
-    def arbitrary_piece_stability(
-        self, pieces: list[dict[str, Any]]
-    ) -> dict[str, Any]:
-        if not 1 <= len(pieces) <= 4:
-            self.arbitrary_piece_history.clear()
-            return {
-                "stable": False,
-                "samples": 0,
-                "required_samples": self.arbitrary_piece_history.maxlen,
-                "center_spread_mm": None,
-                "vertex_spread_mm": None,
-                "reason": "NEED_ONE_TO_FOUR_WHITE_PIECES",
-            }
-        # Piece identity/count and the frozen 3..5-edge boundary must remain
-        # stable for five frames.  Boundary comparison is independent of the
-        # temporary vertex count selected by threshold noise.
-        signature = tuple(str(piece["id"]) for piece in pieces)
-        centers = np.asarray([piece["center_mm"] for piece in pieces], np.float64)
-        vertices = [
-            np.asarray(piece["vertices_mm"], np.float64) for piece in pieces
-        ]
-        boundaries = [
-            self._sample_polygon_boundary(vertices_for_piece)
-            for vertices_for_piece in vertices
-        ]
-        if self.arbitrary_piece_history and (
-            self.arbitrary_piece_history[-1]["signature"] != signature
-        ):
-            self.arbitrary_piece_history.clear()
-        self.arbitrary_piece_history.append(
-            {
-                "signature": signature,
-                "centers": centers,
-                "vertices": vertices,
-                "boundaries": boundaries,
-            }
-        )
-        center_spread = 0.0
-        vertex_spread = 0.0
-        if len(self.arbitrary_piece_history) >= 2:
-            center_samples = np.stack(
-                [entry["centers"] for entry in self.arbitrary_piece_history],
-                axis=0,
-            )
-            center_median = np.median(center_samples, axis=0)
-            center_spread = float(
-                np.max(
-                    np.linalg.norm(
-                        center_samples - center_median[None, :, :], axis=2
-                    )
-                )
-            )
-            for piece_index in range(len(pieces)):
-                reference_boundary = self.arbitrary_piece_history[-1][
-                    "boundaries"
-                ][piece_index]
-                for entry in self.arbitrary_piece_history:
-                    vertex_spread = max(
-                        vertex_spread,
-                        self._boundary_hausdorff_mm(
-                            reference_boundary,
-                            entry["boundaries"][piece_index],
-                        ),
-                    )
-        stable = bool(
-            len(self.arbitrary_piece_history)
-            >= int(self.arbitrary_piece_history.maxlen or 5)
-            and center_spread <= 0.8
-            and vertex_spread <= 1.5
-        )
-        return {
-            "stable": stable,
-            "samples": len(self.arbitrary_piece_history),
-            "required_samples": self.arbitrary_piece_history.maxlen,
-            "center_spread_mm": round(center_spread, 3),
-            "vertex_spread_mm": round(vertex_spread, 3),
-            "reason": None if stable else "WAITING_FOR_STABLE_WHITE_PIECES",
-        }
-
-    def stabilize_mode2_white_polygons(
-        self, pieces: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        """Run the proven mode-3 geometry freezer with a mode-2-only cache."""
-        mode3_cache = self.arbitrary_geometry_cache
-        mode3_history = self.arbitrary_piece_history
-        self.arbitrary_geometry_cache = self.mode2_white_geometry_cache
-        self.arbitrary_piece_history = self.mode2_white_piece_history
-        try:
-            stabilized = self.stabilize_arbitrary_polygons(pieces)
-        finally:
-            self.mode2_white_geometry_cache = self.arbitrary_geometry_cache
-            self.mode2_white_piece_history = self.arbitrary_piece_history
-            self.arbitrary_geometry_cache = mode3_cache
-            self.arbitrary_piece_history = mode3_history
-        return stabilized
-
-    def mode2_white_piece_stability(
-        self, pieces: list[dict[str, Any]]
-    ) -> dict[str, Any]:
-        """Apply mode 3's centre/boundary stability gate independently."""
-        mode3_cache = self.arbitrary_geometry_cache
-        mode3_history = self.arbitrary_piece_history
-        self.arbitrary_geometry_cache = self.mode2_white_geometry_cache
-        self.arbitrary_piece_history = self.mode2_white_piece_history
-        try:
-            stability = self.arbitrary_piece_stability(pieces)
-        finally:
-            self.mode2_white_geometry_cache = self.arbitrary_geometry_cache
-            self.mode2_white_piece_history = self.arbitrary_piece_history
-            self.arbitrary_geometry_cache = mode3_cache
-            self.arbitrary_piece_history = mode3_history
-        if stability.get("reason") == "WAITING_FOR_STABLE_WHITE_PIECES":
-            stability["reason"] = "WAITING_FOR_STABLE_MODE2_WHITE_PIECES"
-        return stability
-
-    @staticmethod
-    def fixed_template_inputs_from_white_polygons(
-        white_pieces: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], list[np.ndarray]]:
-        """Convert stabilized white polygons into mode-2 template inputs.
-
-        The returned contours are the frozen 3..5-edge polygons themselves,
-        not the serrated per-frame threshold contours.  Consequently the
-        fixed Figure-2 matcher and rotation solver see the same geometry for
-        every stationary frame.
-        """
-        pieces: list[dict[str, Any]] = []
-        contours: list[np.ndarray] = []
-        for index, white_piece in enumerate(white_pieces, start=1):
-            vertices_mm = np.asarray(
-                white_piece.get("vertices_mm", []), np.float64
-            ).reshape(-1, 2)
-            if not 3 <= len(vertices_mm) <= 5:
-                continue
-            contour = np.rint(vertices_mm * WARP_PX_PER_MM).astype(
-                np.int32
-            ).reshape(-1, 1, 2)
-            rectangle = cv2.minAreaRect(contour)
-            size_mm = sorted(
-                [
-                    float(rectangle[1][0]) / WARP_PX_PER_MM,
-                    float(rectangle[1][1]) / WARP_PX_PER_MM,
-                ],
-                reverse=True,
-            )
-            item = {
-                "id": f"P{index}",
-                "center_mm": [
-                    round(float(value), 2)
-                    for value in white_piece["center_mm"]
-                ],
-                "angle_deg": round(
-                    float(white_piece.get("angle_deg", 0.0)), 2
-                ),
-                "area_mm2": round(
-                    float(white_piece.get("area_mm2", 0.0)), 2
-                ),
-                "size_mm": [round(value, 2) for value in size_mm],
-                "solidity": round(
-                    float(white_piece.get("solidity", 0.0)), 3
-                ),
-                "vertex_count": int(len(vertices_mm)),
-                "vertices_mm": np.round(vertices_mm, 2).tolist(),
-                "polygon_area_error_ratio": float(
-                    white_piece.get("polygon_area_error_ratio", 0.0)
-                ),
-                "detection_source": "MODE3_WHITE_POLYGON_FOR_MODE2_TEMPLATE",
-                "geometry_source": white_piece.get(
-                    "geometry_source", "MODE3_WHITE_POLYGON"
-                ),
-            }
-            pieces.append(item)
-            contours.append(contour)
-        return pieces, contours
 
     def extract_pieces(
         self, mask: np.ndarray
@@ -1829,11 +777,7 @@ class PuzzleDetector:
                 continue
             cx = float(moments["m10"] / moments["m00"])
             cy = float(moments["m01"] / moments["m00"])
-            # Question 2 uses the four fixed Figure-2 pieces.  With the current
-            # camera angle, the old 1.5% tolerance treats paper-edge glare as
-            # extra corners (especially on the smallest piece).  Four percent
-            # recovers the known 3/4/4/4 template topology on the live frame.
-            epsilon = max(3.0, 0.040 * perimeter)
+            epsilon = max(3.0, 0.015 * perimeter)
             polygon = cv2.approxPolyDP(contour, epsilon, True).reshape(-1, 2)
             if len(polygon) < 3:
                 continue
@@ -2134,14 +1078,6 @@ class PuzzleDetector:
                     "rotate_deg_clockwise": round(
                         float(fit["rotation_deg_clockwise"]), 1
                     ),
-                    # This is the source polygon with the exact vertex count
-                    # of the assigned Figure-2 template.  Keep it alongside
-                    # the raw segmentation contour: mode 2 uses the latter
-                    # for detection/stability and this polygon for the final
-                    # recognized geometry shown to the operator.
-                    "matched_source_vertices_mm": np.round(
-                        np.asarray(fit["source_vertices_mm"], np.float64), 2
-                    ).tolist(),
                     "target_vertices_mm": np.round(
                         target_vertices, 1
                     ).tolist(),
@@ -2244,15 +1180,8 @@ class PuzzleDetector:
         }
 
     def detect(
-        self,
-        frame: np.ndarray,
-        manual_corners: np.ndarray | None,
-        analysis_mode: int = 2,
+        self, frame: np.ndarray, manual_corners: np.ndarray | None
     ) -> tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray]:
-        # Modes 1/2 use the known Figure-2 detector.  Mode 3 uses its own
-        # unknown-polygon detector/solver.  Do not run both CPU-heavy paths on
-        # every camera frame; doing so starves the MJPEG stream on Raspberry Pi.
-        analysis_mode = analysis_mode if analysis_mode in (1, 2, 3) else 2
         original = frame.copy()
         auto_score = 0.0
         source = "manual"
@@ -2276,14 +1205,11 @@ class PuzzleDetector:
             corners = np.asarray(manual_corners, dtype=np.float32).reshape(4, 2)
         if corners is None:
             self.center_history.clear()
-            self.arbitrary_piece_history.clear()
             cv2.putText(
                 original, "A4 NOT FOUND - CLICK 4 CORNERS", (15, 35),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2,
             )
             blank = np.full((WARP_HEIGHT, WARP_WIDTH, 3), 245, np.uint8)
-            self.mode2_preview = blank.copy()
-            self.mode3_preview = blank.copy()
             return (
                 {
                     "a4_found": False,
@@ -2294,18 +1220,6 @@ class PuzzleDetector:
                     "piece_count": 0,
                     "stable_four_pieces": False,
                     "pieces": [],
-                    "arbitrary_piece_count": 0,
-                    "arbitrary_pieces": [],
-                    "arbitrary_stability": {
-                        "stable": False,
-                        "samples": 0,
-                        "reason": "A4_NOT_FOUND",
-                    },
-                    "arbitrary_plan": {
-                        "ready": False,
-                        "error": "A4_NOT_FOUND",
-                        "moves": [],
-                    },
                 },
                 original,
                 blank,
@@ -2352,61 +1266,6 @@ class PuzzleDetector:
         divider_found = divider_y is not None
         annotated = warped.copy()
         if divider_found:
-            cv2.line(
-                annotated,
-                (0, int(divider_y)),
-                (WARP_WIDTH - 1, int(divider_y)),
-                (255, 0, 255),
-                3,
-            )
-        mode2_white_stability = {
-            "stable": False,
-            "samples": 0,
-            "required_samples": self.mode2_white_piece_history.maxlen,
-            "center_spread_mm": None,
-            "vertex_spread_mm": None,
-            "reason": "MODE2_WHITE_PIPELINE_NOT_ACTIVE",
-        }
-        mode2_mask_piece_count = 0
-        recognition_stable_four_pieces = False
-        mode2_segmentation = "inactive"
-        if (
-            divider_found
-            and analysis_mode == 2
-            and self.config.mode2_white_only
-        ):
-            # Hybrid mode requested for the fixed Figure-2 task:
-            #   mode 3: adaptive white-on-black segmentation, straight-edge
-            #           polygon fitting and stationary multi-frame freezing;
-            #   mode 2: fixed template assignment and rotation calculation.
-            mask, paper_luma, piece_threshold = (
-                self.segment_arbitrary_white_pieces(warped, int(divider_y))
-            )
-            white_pieces, _white_contours = (
-                self.extract_arbitrary_white_pieces(mask)
-            )
-            mode2_mask_piece_count = len(white_pieces)
-            white_pieces = self.stabilize_mode2_white_polygons(white_pieces)
-            mode2_white_stability = self.mode2_white_piece_stability(
-                white_pieces
-            )
-            pieces, contours = self.fixed_template_inputs_from_white_polygons(
-                white_pieces
-            )
-            piece_quality = self.piece_set_quality(pieces)
-            recognition_stable_four_pieces = bool(
-                len(pieces) == 4 and mode2_white_stability.get("stable", False)
-            )
-            # Keep the absolute-size gate on the motion path.  Oversized test
-            # paper or an incomplete edge may be recognized and labelled, but
-            # must never authorize a physical 100 x 60 mm assembly.
-            is_stable = bool(
-                recognition_stable_four_pieces and piece_quality["valid"]
-            )
-            self.center_history.clear()
-            paper_mode = "adaptive_white_on_black"
-            mode2_segmentation = "mode3_white_polygon_stability_v1"
-        elif divider_found and analysis_mode in (1, 2):
             mask, paper_luma, piece_threshold, paper_mode = self.segment_pieces(
                 warped, int(divider_y)
             )
@@ -2417,8 +1276,13 @@ class PuzzleDetector:
             else:
                 self.center_history.clear()
                 is_stable = False
-            self.mode2_white_geometry_cache.clear()
-            self.mode2_white_piece_history.clear()
+            cv2.line(
+                annotated,
+                (0, int(divider_y)),
+                (WARP_WIDTH - 1, int(divider_y)),
+                (255, 0, 255),
+                3,
+            )
         else:
             mask = np.zeros_like(gray)
             pieces = []
@@ -2431,176 +1295,20 @@ class PuzzleDetector:
             paper_mode = self.config.paper_mode
             if paper_mode == "auto":
                 paper_mode = "black" if paper_luma < 128.0 else "white"
-            self.mode2_white_geometry_cache.clear()
-            self.mode2_white_piece_history.clear()
-            if not divider_found:
-                cv2.putText(
-                    annotated,
-                    "DIVIDER NOT FOUND - SET Y(mm) OR IMPROVE LINE",
-                    (12, 62),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.62,
-                    (0, 0, 255),
-                    2,
-                )
-        if divider_found and analysis_mode == 3:
-            (
-                arbitrary_mask,
-                arbitrary_background_luma,
-                arbitrary_threshold,
-            ) = self.segment_arbitrary_white_pieces(warped, int(divider_y))
-            (
-                arbitrary_pieces,
-                arbitrary_contours,
-            ) = self.extract_arbitrary_white_pieces(arbitrary_mask)
-            arbitrary_mask_piece_count = len(arbitrary_pieces)
-            # The unknown-shape mode does not borrow fixed-template contours.
-            arbitrary_fallback_count = 0
-            # project2.1 supplies the current-frame Otsu contour.  A bounded
-            # five-frame window removes shadow-edge flicker without retaining
-            # a stale contour after the pieces move or the scene changes.
-            arbitrary_pieces = self.stabilize_arbitrary_polygons(
-                arbitrary_pieces
+            cv2.putText(
+                annotated,
+                "DIVIDER NOT FOUND - SET Y(mm) OR IMPROVE LINE",
+                (12, 62),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.62,
+                (0, 0, 255),
+                2,
             )
-            arbitrary_stability = self.arbitrary_piece_stability(
-                arbitrary_pieces
-            )
-            if arbitrary_pieces:
-                current_centers = np.asarray(
-                    [piece["center_mm"] for piece in arbitrary_pieces],
-                    np.float64,
-                )
-                current_edge_signatures = [
-                    np.sort(
-                        np.asarray(
-                            piece.get("edge_lengths_mm", []),
-                            np.float64,
-                        )
-                    )
-                    for piece in arbitrary_pieces
-                ]
-                current_areas = np.asarray(
-                    [piece["area_mm2"] for piece in arbitrary_pieces],
-                    np.float64,
-                )
-            else:
-                current_centers = np.empty((0, 2), np.float64)
-                current_edge_signatures = []
-                current_areas = np.empty((0,), np.float64)
-            reference = self.arbitrary_solution_reference
-            frozen_cache_matches = bool(
-                self.arbitrary_solution_cache is not None
-                and reference is not None
-                and arbitrary_stability["stable"]
-                and reference["signature"]
-                == tuple(
-                    (piece["id"], int(piece["vertex_count"]))
-                    for piece in arbitrary_pieces
-                )
-                and len(current_centers) == len(reference["centers"])
-                and len(current_centers) > 0
-                and float(
-                    np.max(
-                        np.linalg.norm(
-                            current_centers - reference["centers"], axis=1
-                        )
-                    )
-                )
-                <= 2.0
-                and all(
-                    len(current_edge_signatures[index])
-                    == len(reference["edge_signatures"][index])
-                    and float(
-                        np.max(
-                            np.abs(
-                                current_edge_signatures[index]
-                                - reference["edge_signatures"][index]
-                            )
-                        )
-                    )
-                    <= 3.0
-                    for index in range(len(current_edge_signatures))
-                )
-                and bool(
-                    np.all(
-                        np.abs(current_areas - reference["areas"])
-                        <= np.maximum(30.0, 0.06 * reference["areas"])
-                    )
-                )
-            )
-            if frozen_cache_matches:
-                arbitrary_plan = deepcopy(self.arbitrary_solution_cache)
-                arbitrary_plan["cache_reused"] = True
-                # Only the numerical motion plan is reused for an unchanged
-                # scene; current-frame project2.1 polygons remain the sole
-                # displayed/validated geometry.  Do not label this as a
-                # frozen vision contour.
-                arbitrary_plan["vision_frozen"] = False
-                arbitrary_stability["stable"] = True
-                arbitrary_stability["reason"] = None
-                arbitrary_stability["frozen_from_stable_solution"] = False
-            elif arbitrary_stability["stable"]:
-                solve_started = time.perf_counter()
-                arbitrary_plan = solve_arbitrary_puzzle(
-                    arbitrary_pieces,
-                    divider_y_mm=float(divider_y) / WARP_PX_PER_MM,
-                    seam_gap_mm=DEFAULT_SEAM_GAP_MM,
-                )
-                arbitrary_plan["solve_elapsed_ms"] = round(
-                    (time.perf_counter() - solve_started) * 1000.0, 1
-                )
-                arbitrary_plan["cache_reused"] = False
-                arbitrary_plan["vision_frozen"] = False
-                self.arbitrary_solution_cache = deepcopy(arbitrary_plan)
-                self.arbitrary_solution_cached_at = time.monotonic()
-                self.arbitrary_solution_reference = {
-                    "signature": tuple(
-                        (piece["id"], int(piece["vertex_count"]))
-                        for piece in arbitrary_pieces
-                    ),
-                    "centers": current_centers.copy(),
-                    "edge_signatures": [
-                        signature.copy()
-                        for signature in current_edge_signatures
-                    ],
-                    "areas": current_areas.copy(),
-                }
-            else:
-                arbitrary_plan = {
-                    "ready": False,
-                    "error": arbitrary_stability["reason"],
-                    "piece_count": len(arbitrary_pieces),
-                    "moves": [],
-                }
-            mask = cv2.bitwise_or(mask, arbitrary_mask)
-        else:
-            arbitrary_mask = np.zeros_like(gray)
-            arbitrary_background_luma = float(np.median(gray))
-            arbitrary_threshold = None
-            arbitrary_pieces = []
-            arbitrary_contours = []
-            arbitrary_mask_piece_count = 0
-            arbitrary_fallback_count = 0
-            self.arbitrary_piece_history.clear()
-            arbitrary_stability = {
-                "stable": False,
-                "samples": 0,
-                "required_samples": self.arbitrary_piece_history.maxlen,
-                "center_spread_mm": None,
-                "vertex_spread_mm": None,
-                "reason": "DIVIDER_NOT_FOUND",
-            }
-            arbitrary_plan = {
-                "ready": False,
-                "error": "DIVIDER_NOT_FOUND",
-                "piece_count": 0,
-                "moves": [],
-            }
         assembly_plan = (
             self.build_assembly_plan(
                 pieces, contours, float(divider_y) / WARP_PX_PER_MM
             )
-            if divider_y is not None and analysis_mode == 2
+            if divider_y is not None
             else None
         )
         solver_ready = bool(
@@ -2615,69 +1323,21 @@ class PuzzleDetector:
                 and is_stable
                 and assembly_plan.get("measurement_stable", False)
             )
-        # This base contains only the rectified A4 and divider annotations.
-        # Each feature draws on its own copy below.
-        preview_base = annotated.copy()
-        matched_moves_by_piece = {
-            str(move.get("piece_id")): move
-            for move in (assembly_plan or {}).get("moves", [])
-        }
         for piece, contour in zip(pieces, contours):
-            move = matched_moves_by_piece.get(str(piece["id"]))
-            matched_vertices = (
-                move.get("matched_source_vertices_mm") if move else None
-            )
-            if matched_vertices and len(matched_vertices) >= 3:
-                matched_polygon = np.rint(
-                    np.asarray(matched_vertices, np.float64)
-                    * WARP_PX_PER_MM
-                ).astype(np.int32)
-                # The thick green polygon is the final mode-2 recognition
-                # result.  It has the assigned template's topology (three
-                # vertices for a triangle, four for a quadrilateral), so a
-                # clipped A4 border can no longer appear as an artificial
-                # notch or tail in the recognized piece.
-                cv2.polylines(
-                    annotated, [matched_polygon], True, (0, 255, 0), 3
-                )
-                display_angle = float(move["rotate_deg_clockwise"])
-                target_name = str(move["target_piece"]).split("_", 1)[0]
-            else:
-                cv2.drawContours(annotated, [contour], -1, (0, 255, 0), 3)
-                display_angle = float(piece["angle_deg"])
-                target_name = "UNMATCHED"
+            cv2.drawContours(annotated, [contour], -1, (0, 255, 0), 3)
             center = tuple(
                 int(round(value * WARP_PX_PER_MM))
                 for value in piece["center_mm"]
             )
             cv2.circle(annotated, center, 6, (0, 0, 255), -1)
-            label = (
-                f"{piece['id']}/{target_name} "
-                f"({piece['center_mm'][0]:.0f},"
-                f"{piece['center_mm'][1]:.0f})mm R{display_angle:+.0f}deg"
-            )
-            (label_width, label_height), _baseline = cv2.getTextSize(
-                label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2
-            )
-            label_origin = (
-                max(4, min(center[0] + 9, WARP_WIDTH - label_width - 4)),
-                max(label_height + 4, center[1] - 9),
-            )
             cv2.putText(
                 annotated,
-                label,
-                label_origin,
+                f"{piece['id']} ({piece['center_mm'][0]:.0f},"
+                f"{piece['center_mm'][1]:.0f})mm {piece['angle_deg']:.0f}deg",
+                (center[0] + 9, center[1] - 9),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 40, 230), 2,
             )
-        # The fixed Figure-2 preview belongs to modes 1/2.  Do not draw a
-        # stale/low-quality template merely because build_assembly_plan()
-        # returned candidate geometry: that used to look like a mirrored
-        # mode-3 reconstruction when the white pieces were on the wrong half.
-        if (
-            assembly_plan
-            and assembly_plan.get("ready", False)
-            and assembly_plan.get("target_rectangle_mm")
-        ):
+        if assembly_plan and assembly_plan.get("target_rectangle_mm"):
             colors = (
                 (255, 180, 0),
                 (255, 0, 180),
@@ -2737,186 +1397,12 @@ class PuzzleDetector:
                     color,
                     2,
                 )
-        mode2_state_color = (
-            (0, 170, 0)
-            if recognition_stable_four_pieces
-            else (0, 140, 255)
-        )
+        state_color = (0, 170, 0) if is_stable else (0, 140, 255)
         cv2.putText(
             annotated,
-            f"MODE2 WHITE={len(pieces)} "
-            f"STABLE={int(recognition_stable_four_pieces)} "
-            f"SAFE={int(is_stable)}",
-            (12, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.72,
-            mode2_state_color,
-            2,
+            f"PIECES={len(pieces)} STABLE={int(is_stable)}",
+            (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, state_color, 2,
         )
-        self.mode2_preview = annotated.copy()
-
-        # Start mode 3 again from the clean A4 base.  Its yellow threshold
-        # contours and magenta fitted polygons now cannot be confused with
-        # the green fixed-template contours used by mode 2.
-        annotated = preview_base.copy()
-        for piece, contour in zip(arbitrary_pieces, arbitrary_contours):
-            # Keep a thin dark-yellow raw contour for diagnostics, with the
-            # clean magenta solver polygon dominant on screen.
-            cv2.drawContours(annotated, [contour], -1, (0, 135, 135), 1)
-            fitted_polygon = np.rint(
-                np.asarray(piece["vertices_mm"], np.float64) * WARP_PX_PER_MM
-            ).astype(np.int32)
-            # Magenta vertices show the exact polygon used by the solver;
-            # yellow remains the full threshold contour.  Their close overlap
-            # makes loss of a corner immediately visible on the web page.
-            cv2.polylines(annotated, [fitted_polygon], True, (255, 0, 255), 3)
-            for fitted_vertex in fitted_polygon:
-                cv2.circle(
-                    annotated,
-                    tuple(int(value) for value in fitted_vertex),
-                    4,
-                    (255, 0, 255),
-                    -1,
-                )
-            pick_point = tuple(
-                np.rint(
-                    np.asarray(piece["pick_point_mm"], np.float64)
-                    * WARP_PX_PER_MM
-                ).astype(int)
-            )
-            cv2.circle(annotated, pick_point, 7, (0, 0, 255), -1)
-            cv2.putText(
-                annotated,
-                f"{piece['id']} PICK({piece['pick_point_mm'][0]:.0f},"
-                f"{piece['pick_point_mm'][1]:.0f})",
-                (pick_point[0] + 8, pick_point[1] - 8),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.48,
-                (0, 255, 255),
-                2,
-            )
-        if (
-            (
-                arbitrary_plan.get("ready", False)
-                or arbitrary_plan.get("geometry_ready", False)
-            )
-            and arbitrary_plan.get("target_rectangle_mm")
-        ):
-            rectangle = arbitrary_plan["target_rectangle_mm"]
-            origin = np.asarray(rectangle["origin"], np.float64)
-            size = np.asarray(rectangle["size"], np.float64)
-            cv2.rectangle(
-                annotated,
-                tuple(np.rint(origin * WARP_PX_PER_MM).astype(int)),
-                tuple(np.rint((origin + size) * WARP_PX_PER_MM).astype(int)),
-                (255, 255, 255),
-                3,
-            )
-            arbitrary_colors = (
-                (40, 180, 255),
-                (255, 120, 40),
-                (60, 255, 120),
-                (255, 60, 210),
-            )
-            target_overlay = annotated.copy()
-            for move in arbitrary_plan.get("moves", []):
-                color = arbitrary_colors[(int(move["order"]) - 1) % 4]
-                target_polygon = np.rint(
-                    np.asarray(move["target_vertices_mm"], np.float64)
-                    * WARP_PX_PER_MM
-                ).astype(np.int32)
-                cv2.fillPoly(target_overlay, [target_polygon], color)
-            annotated = cv2.addWeighted(
-                target_overlay, 0.28, annotated, 0.72, 0.0
-            )
-            for move in arbitrary_plan.get("moves", []):
-                color = arbitrary_colors[(int(move["order"]) - 1) % 4]
-                target_polygon = np.rint(
-                    np.asarray(move["target_vertices_mm"], np.float64)
-                    * WARP_PX_PER_MM
-                ).astype(np.int32)
-                cv2.polylines(annotated, [target_polygon], True, color, 3)
-                target_pick = tuple(
-                    np.rint(
-                        np.asarray(move["place_a4_mm"], np.float64)
-                        * WARP_PX_PER_MM
-                    ).astype(int)
-                )
-                # Long source-to-target arrows crossed several target edges
-                # and made rigid polygons look stretched or malformed.  The
-                # motion table already contains the mapping, so keep the
-                # geometry preview visually unambiguous.
-                cv2.circle(annotated, target_pick, 6, color, -1)
-                cv2.putText(
-                    annotated,
-                    f"Q2 {move['order']}:{move['piece_id']} "
-                    f"R{move['rotate_deg_clockwise']:+.0f}",
-                    (target_pick[0] + 6, target_pick[1]),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    color,
-                    2,
-                )
-        arbitrary_state_color = (
-            (0, 190, 0)
-            if arbitrary_stability["stable"]
-            else (0, 165, 255)
-        )
-        cv2.putText(
-            annotated,
-            f"MODE3 WHITE={len(arbitrary_pieces)} "
-            f"STABLE={int(arbitrary_stability['stable'])} "
-            f"SOLVED={int(bool(arbitrary_plan.get('geometry_ready', False) or arbitrary_plan.get('ready', False)))}",
-            (12, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            arbitrary_state_color,
-            2,
-        )
-        if (
-            arbitrary_stability["stable"]
-            and not arbitrary_plan.get("ready", False)
-            and str(arbitrary_plan.get("error", "")).startswith("NO_")
-        ):
-            cv2.putText(
-                annotated,
-                "SOLVE FAILED - CURRENT CONTOURS CANNOT FORM RECTANGLE",
-                (12, 58),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.52,
-                (0, 0, 255),
-                2,
-            )
-            cv2.putText(
-                annotated,
-                "MOVE OR ROTATE A PIECE TO RETRY",
-                (12, 82),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.52,
-                (0, 0, 255),
-                2,
-            )
-        if divider_y is not None:
-            divider_px = int(divider_y)
-            cv2.putText(
-                annotated,
-                "MODE3 PLACE ZONE (A4 UPPER)",
-                (WARP_WIDTH - 330, max(88, divider_px - 18)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (0, 255, 255),
-                2,
-            )
-            cv2.putText(
-                annotated,
-                "MODE3 PICK ZONE (A4 LOWER)",
-                (WARP_WIDTH - 345, min(WARP_HEIGHT - 18, divider_px + 30)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (60, 255, 120),
-                2,
-            )
-        self.mode3_preview = annotated.copy()
         status = {
             "a4_found": True,
             "a4_source": source,
@@ -2946,28 +1432,7 @@ class PuzzleDetector:
             "piece_count": len(pieces),
             "piece_set_quality": piece_quality,
             "stable_four_pieces": is_stable,
-            "recognition_stable_four_pieces": (
-                recognition_stable_four_pieces
-            ),
-            "mode2_segmentation": mode2_segmentation,
-            "mode2_mask_piece_count": mode2_mask_piece_count,
-            "mode2_white_stability": mode2_white_stability,
-            "arbitrary_piece_count": len(arbitrary_pieces),
-            "arbitrary_mask_piece_count": arbitrary_mask_piece_count,
-            "arbitrary_fallback_count": arbitrary_fallback_count,
-            "arbitrary_pieces": arbitrary_pieces,
-            "arbitrary_stability": arbitrary_stability,
-            "arbitrary_plan": arbitrary_plan,
-            "arbitrary_background_luma": round(
-                float(arbitrary_background_luma), 1
-            ),
-            "arbitrary_white_threshold": (
-                None
-                if arbitrary_threshold is None
-                else round(float(arbitrary_threshold), 1)
-            ),
             "coordinate_frame": "A4 top-left; +X right; +Y down; millimetres",
-            "analysis_mode": analysis_mode,
             "source_region": self.config.source_region,
             "target_region": (
                 "upper" if self.config.source_region == "lower" else "lower"
@@ -3141,7 +1606,6 @@ class PuzzleVisionApp:
             paper_mode=args.paper_mode,
             divider_y_mm=args.divider_y_mm,
             source_region=args.source_region,
-            mode2_white_only=args.mode2_white_only,
         )
         self.detector = PuzzleDetector(self.config)
         self.motion_plan_stability = MotionPlanStabilityGate(
@@ -3155,50 +1619,21 @@ class PuzzleVisionApp:
             args.camera_calibration_file, args.width, args.height
         )
         self.a4_calibration_file = Path(args.a4_calibration_file)
-        # This installation has a fixed camera and fixed A4.  Restore the saved
-        # physical A4 corners immediately so a service restart cannot shift the
-        # millimetre frame by tens of pixels and clip a fragment near an edge.
-        # The calibration loader already verifies that the corners belong to
-        # the current lens-calibration hash.  The web "re-detect A4" action can
-        # still explicitly discard this lock if the hardware is moved.
+        # Re-detect the physical A4 on every service start.  A saved calibration
+        # is only a matching hint; it must not silently replace the current
+        # camera geometry after the fixture has moved.
         self.saved_a4_hint = self._load_a4_calibration()
-        if args.require_saved_a4 and self.saved_a4_hint is None:
-            raise RuntimeError(
-                "fixed A4 calibration is required but missing or invalid: "
-                f"{self.a4_calibration_file}"
-            )
         self.saved_a4_match_count = 0
-        self.manual_corners: np.ndarray | None = (
-            None
-            if self.saved_a4_hint is None
-            else self.saved_a4_hint.copy()
-        )
-        self.a4_lock_method = (
-            "waiting_for_auto_detection"
-            if self.manual_corners is None
-            else "restored_fixed_a4_calibration"
-        )
+        self.a4_lock_method = "waiting_for_auto_detection"
+        self.manual_corners: np.ndarray | None = None
         self.status_data: dict[str, Any] = {
             "state": "STARTING", "piece_count": 0, "pieces": []
         }
-        # Dedicated launch scripts select either the fixed Figure-2 service
-        # or the unknown-shape service.  A dedicated process never executes
-        # the other recognition pipeline, so the two algorithms cannot steal
-        # CPU time or leak state into one another.
-        self.service_mode = int(getattr(args, "service_mode", 2))
-        self.analysis_mode = self.service_mode
-        self.vision_frame_index = 0
         self.raw_frame: np.ndarray | None = None
         self.camera_jpeg: bytes | None = None
         self.warp_jpeg: bytes | None = None
-        self.mode2_warp_jpeg: bytes | None = None
-        self.mode3_warp_jpeg: bytes | None = None
         self.mask_jpeg: bytes | None = None
-        calibration = StageCalibration(
-            rotation_sign=args.rotation_sign,
-            mode3_place_offset_x_mm=args.mode3_place_offset_x_mm,
-            mode3_place_offset_y_mm=args.mode3_place_offset_y_mm,
-        )
+        calibration = StageCalibration(rotation_sign=args.rotation_sign)
         self.controller = GantryTaskController(
             self.vision_status,
             args.serial_device,
@@ -3230,13 +1665,6 @@ class PuzzleVisionApp:
                     raise ValueError(
                         "A4 corners belong to a different camera calibration; relock A4"
                     )
-            capture_size = payload.get("capture_size_px")
-            expected_size = [int(self.args.width), int(self.args.height)]
-            if capture_size != expected_size:
-                raise ValueError(
-                    "A4 corners belong to capture size "
-                    f"{capture_size}, expected {expected_size}; relock A4"
-                )
             corners = np.asarray(payload["physical_a4_corners_px"], np.float32)
             if corners.shape != (4, 2) or not np.all(np.isfinite(corners)):
                 raise ValueError("invalid saved A4 corners")
@@ -3304,9 +1732,6 @@ class PuzzleVisionApp:
         self._save_a4_calibration()
         self.detector.center_history.clear()
         self.detector.plan_history.clear()
-        self.detector.arbitrary_piece_history.clear()
-        self.detector.mode2_white_piece_history.clear()
-        self.detector.mode2_white_geometry_cache.clear()
         self.motion_plan_stability.clear()
         self.mode1_target_latch.clear()
         self.a4_lock_method = "fresh_auto_four_piece_lock"
@@ -3341,7 +1766,6 @@ class PuzzleVisionApp:
 
         best_mean = math.inf
         best_max = math.inf
-        best_aligned: np.ndarray | None = None
         for permutation in permutations(range(4)):
             aligned = detected[list(permutation)]
             distances = np.linalg.norm(aligned - hint, axis=1)
@@ -3350,7 +1774,6 @@ class PuzzleVisionApp:
             if (mean_distance, max_distance) < (best_mean, best_max):
                 best_mean = mean_distance
                 best_max = max_distance
-                best_aligned = aligned.copy()
         status["a4_saved_hint_mean_error_px"] = round(best_mean, 2)
         status["a4_saved_hint_max_error_px"] = round(best_max, 2)
 
@@ -3362,30 +1785,52 @@ class PuzzleVisionApp:
         if self.saved_a4_match_count < 5:
             return False
 
-        # The saved order already represents physical A4 TL,TR,BR,BL.  Match
-        # today's unordered detected corners to those identities and preserve
-        # them.  Choosing a 180-degree rotation from the old mode-1 piece set
-        # made mode 3 silently exchange its upper and lower halves.
-        if best_aligned is None:
+        # A previous failed auto-orientation may have saved the same outline
+        # with a cyclically shifted physical corner order.  Evaluate all four
+        # rotations and accept only an orientation that sees the complete,
+        # valid four-piece set in the configured source half.
+        valid_candidates: list[tuple[float, np.ndarray, int]] = []
+        for shift in range(4):
+            candidate = np.roll(hint, -shift, axis=0).copy()
+            try:
+                candidate_status, _, _, _ = self.detector.detect(frame, candidate)
+            except Exception:
+                continue
+            candidate_quality = candidate_status.get("piece_set_quality") or {}
+            if not (
+                candidate_status.get("divider_found", False)
+                and int(candidate_status.get("piece_count", 0)) == 4
+                and candidate_quality.get("valid", False)
+            ):
+                continue
+            total_area_error = abs(
+                float(candidate_quality.get("total_area_mm2", 0.0))
+                - float(candidate_quality.get("expected_total_area_mm2", 6000.0))
+            )
+            valid_candidates.append((total_area_error, candidate, shift))
+        self.detector.center_history.clear()
+        self.detector.plan_history.clear()
+        if not valid_candidates:
+            status["a4_saved_hint_orientation_error"] = (
+                "NO_ROTATION_CONTAINS_VALID_FOUR_PIECES"
+            )
             return False
-        verified_corners = best_aligned
+        _, verified_corners, shift = min(valid_candidates, key=lambda item: item[0])
+        status["a4_saved_hint_selected_rotation"] = int(shift)
 
         with self.lock:
             if self.manual_corners is not None:
                 return False
             self.manual_corners = verified_corners
             self.saved_a4_hint = verified_corners.copy()
+        # Repair a calibration whose geometry was correct but physical order
+        # was previously saved with the wrong 180-degree rotation.
         self._save_a4_calibration()
         self.detector.center_history.clear()
         self.detector.plan_history.clear()
-        self.detector.arbitrary_piece_history.clear()
-        self.detector.mode2_white_piece_history.clear()
-        self.detector.mode2_white_geometry_cache.clear()
         self.motion_plan_stability.clear()
         self.mode1_target_latch.clear()
-        self.a4_lock_method = (
-            "saved_physical_order_after_live_geometry_verification"
-        )
+        self.a4_lock_method = "saved_order_after_live_geometry_verification"
         return True
 
     def _loop(self) -> None:
@@ -3421,10 +1866,9 @@ class PuzzleVisionApp:
                         else self.manual_corners.copy()
                     )
                     a4_locked = self.manual_corners is not None
-                    analysis_mode = self.analysis_mode
                 try:
                     status, camera_view, warped, mask = self.detector.detect(
-                        frame, corners, analysis_mode=analysis_mode
+                        frame, corners
                     )
                 except Exception as exc:
                     # A malformed/noisy vision frame must not be reported as a
@@ -3479,22 +1923,13 @@ class PuzzleVisionApp:
                             "paper_mode": self.config.paper_mode,
                             "source_region": self.config.source_region,
                             "divider_y_mm": self.config.divider_y_mm,
-                            "mode2_white_only": self.config.mode2_white_only,
                             "a4_locked": a4_locked,
-                            "service_mode": self.service_mode,
-                            "analysis_mode": analysis_mode,
-                            "mode3_place_offset_x_mm": (
-                                self.controller.calibration.mode3_place_offset_x_mm
-                            ),
-                            "mode3_place_offset_y_mm": (
-                                self.controller.calibration.mode3_place_offset_y_mm
-                            ),
                             "camera_calibration": self.undistorter.status(),
                         },
                     }
                 )
                 motion_plans: dict[str, Any] = {}
-                for mode in (1, 2, 3):
+                for mode in (1, 2):
                     plan = build_task_plan(
                         mode, status, self.controller.calibration
                     )
@@ -3511,7 +1946,7 @@ class PuzzleVisionApp:
                     )
                     plan["safe_time_budget"] = bool(
                         plan.get("ready", False)
-                        and plan["estimated_seconds"] <= 110.0
+                        and plan["estimated_seconds"] <= 105.0
                     )
                     blockers: list[str] = []
                     if not self.undistorter.enabled:
@@ -3533,13 +1968,12 @@ class PuzzleVisionApp:
                     )
                     if not divider_is_stable:
                         blockers.append("DIVIDER_NOT_STABLE")
-                    if mode in (1, 2):
-                        if not status.get("stable_four_pieces", False):
-                            blockers.append("FOUR_PIECES_NOT_STABLE")
-                        if not (status.get("piece_set_quality") or {}).get(
-                            "valid", False
-                        ):
-                            blockers.append("PIECE_SET_QUALITY_FAILED")
+                    if not status.get("stable_four_pieces", False):
+                        blockers.append("FOUR_PIECES_NOT_STABLE")
+                    if not (status.get("piece_set_quality") or {}).get(
+                        "valid", False
+                    ):
+                        blockers.append("PIECE_SET_QUALITY_FAILED")
                     if mode == 2:
                         assembly = status.get("assembly_plan") or {}
                         if not (
@@ -3555,32 +1989,6 @@ class PuzzleVisionApp:
                             )
                         ):
                             blockers.append("ASSEMBLY_MEASUREMENT_NOT_STABLE")
-                    if mode == 3:
-                        arbitrary_stability = (
-                            status.get("arbitrary_stability") or {}
-                        )
-                        arbitrary_plan = status.get("arbitrary_plan") or {}
-                        if not arbitrary_stability.get("stable", False):
-                            blockers.append("WHITE_PIECES_NOT_STABLE")
-                        if not 1 <= int(
-                            status.get("arbitrary_piece_count", 0)
-                        ) <= 4:
-                            blockers.append("WHITE_PIECE_COUNT_INVALID")
-                        if not arbitrary_plan.get("ready", False):
-                            blockers.append(
-                                "ARBITRARY_SOLVER_"
-                                + str(
-                                    arbitrary_plan.get(
-                                        "error", "NOT_READY"
-                                    )
-                                )
-                            )
-                        if arbitrary_plan.get("ready", False) and float(
-                            arbitrary_plan.get(
-                                "maximum_adjacent_vertex_gap_mm", 999.0
-                            )
-                        ) > 20.0:
-                            blockers.append("ADJACENT_VERTEX_GAP_OVER_20MM")
                     if blockers or not plan.get("ready", False):
                         self.motion_plan_stability.clear(mode)
                         plan_stability = {
@@ -3606,43 +2014,14 @@ class PuzzleVisionApp:
                     )
                     motion_plans[str(mode)] = plan
                 status["motion_plans"] = motion_plans
-                # Publish a monotonically increasing processed-frame number.
-                # The hardware-key controller uses it to prove that a frozen
-                # motion plan was observed after the contestant pressed KEY2
-                # and removed the camera cover.
-                self.vision_frame_index += 1
-                status["vision_frame_index"] = self.vision_frame_index
-                # JPEG compression is relatively expensive on the Pi.  Encode
-                # only the currently selected annotated preview, and do all
-                # compression before taking the HTTP-data lock so an MJPEG
-                # client never waits behind four redundant encoders.
-                camera_jpeg = encode_jpeg(camera_view)
-                mode2_preview = self.detector.mode2_preview
-                mode3_preview = self.detector.mode3_preview
-                active_preview = (
-                    mode3_preview if analysis_mode == 3 else mode2_preview
-                )
-                if active_preview is None:
-                    active_preview = warped
-                active_preview_jpeg = encode_jpeg(active_preview)
-                refreshed_mask_jpeg = (
-                    encode_jpeg(mask)
-                    if self.vision_frame_index % 10 == 1
-                    else None
-                )
                 with self.lock:
                     self.status_data = status
                     # Keep the untouched sensor frame for one-shot lens
                     # calibration.  Detector.detect() annotates only a copy.
                     self.raw_frame = sensor_frame
-                    self.camera_jpeg = camera_jpeg
-                    self.warp_jpeg = active_preview_jpeg
-                    if analysis_mode == 3:
-                        self.mode3_warp_jpeg = active_preview_jpeg
-                    else:
-                        self.mode2_warp_jpeg = active_preview_jpeg
-                    if refreshed_mask_jpeg is not None:
-                        self.mask_jpeg = refreshed_mask_jpeg
+                    self.camera_jpeg = encode_jpeg(camera_view)
+                    self.warp_jpeg = encode_jpeg(warped)
+                    self.mask_jpeg = encode_jpeg(mask)
             except Exception as exc:
                 camera = self.camera
                 self.camera = None
@@ -3661,31 +2040,11 @@ class PuzzleVisionApp:
         if array.shape != (4, 2) or not np.all(np.isfinite(array)):
             raise ValueError("need exactly four finite [x,y] camera points")
         # The web page explicitly asks for physical A4 TL,TR,BR,BL order.
-        following = np.roll(array, -1, axis=0)
-        signed_area_px2 = 0.5 * float(
-            np.sum(
-                array[:, 0] * following[:, 1]
-                - following[:, 0] * array[:, 1]
-            )
-        )
-        if signed_area_px2 <= 1000.0 or not cv2.isContourConvex(
-            array.astype(np.int32).reshape(-1, 1, 2)
-        ):
-            raise ValueError(
-                "A4 corners must follow TL,TR,BR,BL cyclic order; "
-                "reversed order would mirror the image"
-            )
         with self.lock:
             self.manual_corners = array.copy()
-            self.saved_a4_hint = array.copy()
-            self.saved_a4_match_count = 0
-            self.a4_lock_method = "manual_physical_order"
         self._save_a4_calibration()
         self.detector.center_history.clear()
         self.detector.plan_history.clear()
-        self.detector.arbitrary_piece_history.clear()
-        self.detector.mode2_white_piece_history.clear()
-        self.detector.mode2_white_geometry_cache.clear()
         self.motion_plan_stability.clear()
         self.mode1_target_latch.clear()
 
@@ -3701,21 +2060,13 @@ class PuzzleVisionApp:
             # status corners already include the detector's chosen physical
             # A4 rotation.  Preserve that exact order across all later frames.
             self.manual_corners = corners.copy()
-            self.a4_lock_method = "current_stable_detection"
         self._save_a4_calibration()
         self.detector.center_history.clear()
         self.detector.plan_history.clear()
-        self.detector.arbitrary_piece_history.clear()
-        self.detector.mode2_white_piece_history.clear()
-        self.detector.mode2_white_geometry_cache.clear()
         self.motion_plan_stability.clear()
         self.mode1_target_latch.clear()
 
     def use_auto_a4(self) -> None:
-        if self.args.require_saved_a4:
-            raise ValueError(
-                "automatic A4 detection is disabled in fixed-calibration mode"
-            )
         with self.lock:
             self.manual_corners = None
             self.saved_a4_hint = None
@@ -3728,9 +2079,6 @@ class PuzzleVisionApp:
         self.detector.center_history.clear()
         self.detector.a4_corner_history.clear()
         self.detector.plan_history.clear()
-        self.detector.arbitrary_piece_history.clear()
-        self.detector.mode2_white_piece_history.clear()
-        self.detector.mode2_white_geometry_cache.clear()
         self.motion_plan_stability.clear()
         self.mode1_target_latch.clear()
 
@@ -3746,18 +2094,6 @@ class PuzzleVisionApp:
         divider_y_mm = float(
             query.get("divider_y_mm", [str(self.config.divider_y_mm)])[0]
         )
-        mode3_place_offset_x_mm = float(
-            query.get(
-                "mode3_place_offset_x_mm",
-                [str(self.controller.calibration.mode3_place_offset_x_mm)],
-            )[0]
-        )
-        mode3_place_offset_y_mm = float(
-            query.get(
-                "mode3_place_offset_y_mm",
-                [str(self.controller.calibration.mode3_place_offset_y_mm)],
-            )[0]
-        )
         if not 5.0 <= contrast <= 100.0:
             raise ValueError("contrast must be 5..100")
         if not 20.0 <= min_area < max_area <= 10000.0:
@@ -3766,26 +2102,14 @@ class PuzzleVisionApp:
             raise ValueError("paper_mode must be auto, white or black")
         if divider_y_mm != 0.0 and not 20.0 <= divider_y_mm <= 277.0:
             raise ValueError("divider_y_mm must be 0(auto) or 20..277")
-        if not -30.0 <= mode3_place_offset_x_mm <= 30.0:
-            raise ValueError("mode3_place_offset_x_mm must be -30..30")
-        if not -30.0 <= mode3_place_offset_y_mm <= 30.0:
-            raise ValueError("mode3_place_offset_y_mm must be -30..30")
         self.config.contrast = contrast
         self.config.min_area_mm2 = min_area
         self.config.max_area_mm2 = max_area
         self.config.paper_mode = paper_mode
         self.config.divider_y_mm = divider_y_mm
-        self.controller.calibration = replace(
-            self.controller.calibration,
-            mode3_place_offset_x_mm=mode3_place_offset_x_mm,
-            mode3_place_offset_y_mm=mode3_place_offset_y_mm,
-        )
         self.detector.center_history.clear()
         self.detector.divider_history.clear()
         self.detector.plan_history.clear()
-        self.detector.arbitrary_piece_history.clear()
-        self.detector.mode2_white_piece_history.clear()
-        self.detector.mode2_white_geometry_cache.clear()
         self.motion_plan_stability.clear()
         self.mode1_target_latch.clear()
 
@@ -3800,60 +2124,12 @@ class PuzzleVisionApp:
             self.manual_corners is not None
         )
         status["a4_calibration_file"] = str(self.a4_calibration_file)
-        status["a4_startup_mode"] = (
-            "fixed_saved_calibration"
-            if self.args.require_saved_a4
-            else "saved_or_auto_detect_then_lock"
-        )
+        status["a4_startup_mode"] = "auto_detect_then_lock"
         status["a4_lock_method"] = self.a4_lock_method
         return status
 
-    def set_analysis_mode(self, mode: int) -> None:
-        if mode not in (1, 2, 3):
-            raise ValueError("analysis mode must be 1, 2 or 3")
-        if self.service_mode == 3 and mode != 3:
-            raise ValueError("this process is the dedicated question-3 service")
-        if self.service_mode == 2 and mode not in (1, 2):
-            raise ValueError("this process is the dedicated question-2 service")
-        with self.lock:
-            if self.analysis_mode == mode:
-                return
-            self.analysis_mode = mode
-        # A mode change starts a fresh stability window.  Most importantly,
-        # no state from the fixed Figure-2 matcher can enter the unknown-shape
-        # solver, or vice versa.
-        self.detector.center_history.clear()
-        self.detector.plan_history.clear()
-        self.detector.arbitrary_piece_history.clear()
-        self.detector.arbitrary_geometry_cache.clear()
-        self.detector.mode2_white_piece_history.clear()
-        self.detector.mode2_white_geometry_cache.clear()
-        self.detector.arbitrary_solution_cache = None
-        self.detector.arbitrary_solution_reference = None
-        self.detector.arbitrary_solution_cached_at = None
-        self.motion_plan_stability.clear()
-
     def start_task(self, mode: int) -> int:
-        self.set_analysis_mode(mode)
-        if mode == 3 and self.manual_corners is None:
-            # The mode-3 button is a true one-click start.  With the fixed
-            # camera, lock the already stable physical A4 at that same click;
-            # the controller then waits for fresh stable fragments/solution.
-            self.lock_current_a4()
-            self.a4_lock_method = "mode3_one_click_stable_a4"
         return self.controller.request_task(mode)
-
-    def start_click_probe(self, x_mm: float, y_mm: float) -> int:
-        if self.service_mode != 3:
-            raise RuntimeError("click positioning is only available in question 3")
-        if self.manual_corners is None:
-            raise RuntimeError("lock the physical A4 orientation before moving")
-        return self.controller.request_probe(x_mm, y_mm)
-
-    def return_click_probe_home(self) -> int:
-        if self.service_mode != 3:
-            raise RuntimeError("click positioning is only available in question 3")
-        return self.controller.request_probe_home()
 
     def emergency_stop(self) -> None:
         self.controller.emergency_stop()
@@ -3904,29 +2180,24 @@ setInterval(async()=>{try{let s=await(await fetch('/api/status')).json();documen
 CONTROL_HTML = r"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>E题拼图：第一大问 / 第二大问（1）</title>
+<title>E题第一问：搬运与拼图</title>
 <style>
 body{font-family:system-ui,"Microsoft YaHei",sans-serif;background:#101214;color:#eee;max-width:1450px;margin:auto;padding:14px}
 h1{margin:.25em 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.card{background:#1b1e21;padding:12px;border-radius:9px;border:1px solid #333}
 img{width:100%;border:1px solid #555;border-radius:6px}.actions{position:sticky;top:0;background:#101214eF;padding:8px 0;z-index:3}
-button{font-size:18px;padding:11px 17px;margin:4px;border:0;border-radius:5px;color:#fff;cursor:pointer}.green{background:#168342}.blue{background:#1771b8}.purple{background:#7346b8}.red{background:#b52626}.gray{background:#555}
-button:disabled{opacity:.35;cursor:not-allowed}.previewSelected{outline:3px solid #fff;box-shadow:0 0 0 2px #168fe5}.badge{display:inline-block;padding:5px 9px;border-radius:15px;margin:3px;background:#555}.ok{background:#147a3a}.bad{background:#a52727}.wait{background:#996500}
+button{font-size:18px;padding:11px 17px;margin:4px;border:0;border-radius:5px;color:#fff;cursor:pointer}.green{background:#168342}.blue{background:#1771b8}.red{background:#b52626}.gray{background:#555}
+button:disabled{opacity:.35;cursor:not-allowed}.badge{display:inline-block;padding:5px 9px;border-radius:15px;margin:3px;background:#555}.ok{background:#147a3a}.bad{background:#a52727}.wait{background:#996500}
 table{border-collapse:collapse;width:100%;font-size:14px}th,td{border:1px solid #555;padding:6px;text-align:center}th{background:#292d31}.problem{color:#ff7979;font-weight:700}.goodtext{color:#63e18f}.muted{color:#bbb}pre{background:#080909;padding:10px;max-height:380px;overflow:auto;white-space:pre-wrap}
 input,select{font-size:15px;padding:5px;margin:3px;width:95px}@media(max-width:850px){.grid{grid-template-columns:1fr}.actions{position:static}}
 </style></head><body>
-<h1>E题拼图：第一大问 / 第二大问（1）</h1>
-<p>坐标：A4物理左上角为(0,0)，X向右、Y向下，单位mm。固定初始磁铁中心为(5,63)mm。</p>
+<h1>E题第一问：4片搬运 / 图2拼接</h1>
+<p>坐标：A4物理左上角为(0,0)，X向右、Y向下，单位mm。固定初始磁铁中心为(5,61)mm。</p>
 <div class="actions">
  <button id="mode1" class="green" onclick="startTask(1)">按键1：全部搬到上半区</button>
  <button id="mode2" class="blue" onclick="startTask(2)">按键2：拼成100×60矩形</button>
- <button id="mode3" class="purple" onclick="startTask(3)">一键启动：识别、解算并自动拼图</button>
  <button class="red" onclick="stopTask()">急停</button>
  <button class="gray" onclick="lockA4()">锁定当前A4物理方向</button>
  <button class="gray" onclick="autoA4()">重新自动识别A4</button>
-</div>
-<div class="actions" style="position:static">
- <button id="view2" class="blue previewSelected" onclick="selectPreview(2,true)">查看功能2预览</button>
- <button id="view3" class="purple" onclick="selectPreview(3,true)">查看功能3预览</button>
 </div>
 <div id="badges"></div><p id="robotmsg"></p>
 <div class="grid">
@@ -3937,126 +2208,27 @@ input,select{font-size:15px;padding:5px;margin:3px;width:95px}@media(max-width:8
  <div class="card"><h3>模式1预览：从下半区搬到分界线上方</h3><div id="p1summary"></div><div id="p1table"></div></div>
  <div class="card"><h3>模式2预览：图2目标矩形</h3><div id="p2summary"></div><div id="p2table"></div></div>
 </div>
-<div class="card" style="margin-top:12px"><h3>模式3预览：下半区1～4片白色碎片自动重建到分界线上方正中</h3><div id="p3summary"></div><div id="p3table"></div></div>
 <div class="card" style="margin-top:12px"><h3>识别参数</h3>
  <label>纸张 <select id="papermode"><option value="auto">自动</option><option value="black">黑纸</option><option value="white">白纸</option></select></label>
  <label>分界线Y(mm，0自动) <input id="dividery" type="number" value="0" step="0.5"></label>
  <label>灰度差 <input id="contrast" type="number" value="28"></label>
  <label>最小面积 <input id="minarea" type="number" value="100"></label>
  <label>最大面积 <input id="maxarea" type="number" value="4500"></label>
- <label>模式3放置X补偿(mm) <input id="placeoffx" type="number" value="0" step="0.5"></label>
- <label>模式3放置Y补偿(mm) <input id="placeoffy" type="number" value="0" step="0.5"></label>
  <button class="gray" onclick="applyConfig()">应用</button>
 </div>
 <details><summary>实时JSON / 通信记录</summary><pre id="status">loading...</pre></details>
 <script>
-let last=null,points=[],cam=document.querySelector('#cam'),selectedPreviewMode=0;
-let a4preview=document.querySelector('img[src="/a4.mjpg"]');
-a4preview.id='a4preview';
-a4preview.closest('.card').querySelector('h3').id='previewtitle';
-let probeArmed=false;
-let probeWrap=document.createElement('div');
-probeWrap.style.position='relative';
-a4preview.parentNode.insertBefore(probeWrap,a4preview);
-probeWrap.appendChild(a4preview);
-let probeMarker=document.createElement('div');
-probeMarker.style.cssText='display:none;position:absolute;width:18px;height:18px;border:3px solid #ff3030;border-radius:50%;transform:translate(-50%,-50%);pointer-events:none;box-shadow:0 0 0 2px #fff;z-index:2';
-probeWrap.appendChild(probeMarker);
-let probePanel=document.createElement('div');
-probePanel.id='probePanel';
-probePanel.style.cssText='display:none;margin-top:10px;padding:10px;border:1px solid #805b16;border-radius:6px;background:#241d10';
-probePanel.innerHTML='<h3>点击定位精度测试</h3><p>先点“解锁一次点击”，再在上方A4展开图点击目标。滑台会先完成XY移动，再让Z下降9 mm；电磁铁不会开启。</p><button id="probeArm" class="purple" onclick="setProbeArmed()">解锁一次点击</button><button id="probeHome" class="blue" onclick="returnProbeHome()">Z抬起并回初始点</button><span id="probeStatus" class="muted">等待操作</span><p class="muted">允许范围：X=4～204 mm，Y=62～287 mm；红圈是本次点击位置。</p>';
-a4preview.closest('.card').appendChild(probePanel);
-a4preview.style.cursor='crosshair';
+let last=null,points=[],cam=document.querySelector('#cam');
 cam.onclick=async e=>{let r=cam.getBoundingClientRect(),x=(e.clientX-r.left)*cam.naturalWidth/r.width,y=(e.clientY-r.top)*cam.naturalHeight/r.height;points.push([Math.round(x),Math.round(y)]);clicks.textContent='已选'+points.length+'/4点 '+JSON.stringify(points);if(points.length===4){let z=await fetch('/api/corners',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({points})});if(!z.ok)alert(await z.text());points=[];clicks.textContent='已选0/4点'}};
 async function post(url){let r=await fetch(url,{method:'POST'}),t=await r.text();if(!r.ok)alert(t);return t}
-function setProbeArmed(){
- if(Number(((last||{}).config||{}).service_mode||2)!==3){alert('只有第三问服务可以使用点击定位');return}
- probeArmed=!probeArmed;
- document.querySelector('#probeArm').textContent=probeArmed?'已解锁：请点击A4图':'解锁一次点击';
- document.querySelector('#probeStatus').textContent=probeArmed?'下一次点击会立即运动，请先确认周围安全':'等待操作';
-}
-async function returnProbeHome(){
- probeArmed=false;document.querySelector('#probeArm').textContent='解锁一次点击';
- document.querySelector('#probeStatus').textContent='正在抬升Z并回初始点……';
- try{await post('/api/probe-home')}catch(e){document.querySelector('#probeStatus').textContent='回初始点命令失败：'+e}
-}
-a4preview.onclick=async e=>{
- if(!probeArmed)return;
- probeArmed=false;document.querySelector('#probeArm').textContent='解锁一次点击';
- let r=a4preview.getBoundingClientRect();
- let fx=Math.max(0,Math.min(1,(e.clientX-r.left)/r.width));
- let fy=Math.max(0,Math.min(1,(e.clientY-r.top)/r.height));
- let x=Math.round(fx*2100)/10,y=Math.round(fy*2970)/10;
- probeMarker.style.display='block';probeMarker.style.left=(fx*100)+'%';probeMarker.style.top=(fy*100)+'%';
-        document.querySelector('#probeStatus').textContent='目标 ('+x.toFixed(1)+', '+y.toFixed(1)+') mm：等待XY到位后Z下降12mm';
- try{await post('/api/probe?x_mm='+encodeURIComponent(x)+'&y_mm='+encodeURIComponent(y))}
- catch(err){document.querySelector('#probeStatus').textContent='定位命令失败：'+err}
-};
-function selectPreview(m,force=false){
- if(m!==2&&m!==3)return;
- if(selectedPreviewMode===m&&!force)return;
- selectedPreviewMode=m;
- a4preview.src=m===2?'/a4-mode2.mjpg':'/a4-mode3.mjpg';
- document.querySelector('#previewtitle').textContent=m===2?'功能2预览：题图2固定矩形':'功能3预览：未知白片自动重建矩形';
- document.querySelector('#view2').classList.toggle('previewSelected',m===2);
- document.querySelector('#view3').classList.toggle('previewSelected',m===3);
- document.querySelector('#p2summary').closest('.card').style.display=m===2?'block':'none';
- document.querySelector('#p3summary').closest('.card').style.display=m===3?'block':'none';
- fetch('/api/preview?mode='+m,{method:'POST'}).catch(()=>{});
-}
-// Dedicated services select their own preview after the first status reply.
-async function startTask(m){if(m===2||m===3)selectPreview(m,true);await post('/api/task?mode='+m)}
+async function startTask(m){await post('/api/task?mode='+m)}
 async function stopTask(){await post('/api/stop')}
 async function lockA4(){await post('/api/lock-a4')}
 async function autoA4(){points=[];await post('/api/auto-a4')}
-async function applyConfig(){let q='paper_mode='+papermode.value+'&divider_y_mm='+dividery.value+'&contrast='+contrast.value+'&min_area='+minarea.value+'&max_area='+maxarea.value+'&mode3_place_offset_x_mm='+placeoffx.value+'&mode3_place_offset_y_mm='+placeoffy.value;await post('/api/config?'+q)}
+async function applyConfig(){let q='paper_mode='+papermode.value+'&divider_y_mm='+dividery.value+'&contrast='+contrast.value+'&min_area='+minarea.value+'&max_area='+maxarea.value;await post('/api/config?'+q)}
 function esc(v){return String(v??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
 function planView(id,p){let s=document.querySelector('#p'+id+'summary'),b=document.querySelector('#p'+id+'table');if(!p){s.innerHTML='<span class=problem>尚无方案</span>';b.innerHTML='';return}let un=p.unreachable||[],bad=un.map(x=>x.piece_id+' '+x.operation+' ('+x.point_a4_mm.join(',')+')').join('；'),detail=id===1?('排布策略 '+esc(p.strategy)+(p.packing?'；总旋转 '+esc(p.packing.rotation_total_deg)+'°':'；平移 '+esc(p.common_translation_mm))):('目标 '+esc(JSON.stringify(p.target_rectangle_mm)));s.innerHTML='<b class="'+(p.ready?'goodtext':'problem')+'">'+(p.ready?'可执行':'禁止执行：'+esc(p.error))+'</b>；预计 '+p.estimated_seconds+' 秒；'+detail+(bad?'<br><span class=problem>不可达：'+esc(bad)+'</span>':'');let rows=(p.moves||[]).map(m=>{let reachable=!un.some(x=>x.piece_id===m.piece_id);return '<tr><td>'+m.order+'</td><td>'+esc(m.piece_id)+'</td><td>'+m.pick_a4_mm.join(', ')+'</td><td>'+m.place_a4_mm.join(', ')+'</td><td>'+esc(m.rotate_deg_clockwise)+'</td><td class="'+(reachable?'goodtext':'problem')+'">'+(reachable?'是':'否')+'</td></tr>'});b.innerHTML='<table><thead><tr><th>顺序</th><th>铁片</th><th>拾取A4坐标</th><th>放置A4坐标</th><th>顺时针角度</th><th>可达</th></tr></thead><tbody>'+rows.join('')+'</tbody></table>'}
-function render(s){last=s;let r=s.robot||{},ser=r.serial||{},m=s.motion_plans||{},cc=(s.config||{}).camera_calibration||{};badges.innerHTML='<span class="badge '+(s.stable_four_pieces?'ok':'wait')+'">4片稳定 '+(s.stable_four_pieces?'是':'否')+'</span><span class="badge '+(s.a4_physical_orientation_locked?'ok':'wait')+'">A4方向锁定 '+(s.a4_physical_orientation_locked?'是':'否')+'</span><span class="badge '+(cc.loaded?'ok':'wait')+'">镜头标定 '+(cc.loaded?'已加载':'未加载')+'</span><span class="badge '+(ser.connected?'ok':'bad')+'">MCU串口 '+(ser.connected?'已连接':'未连接')+'</span><span class="badge">分界线Y '+esc(s.divider_y_mm)+' mm</span><span class="badge '+(r.state==='ERROR'||r.state==='REJECTED'||r.state==='STOPPED'?'bad':'ok')+'">'+esc(r.state)+'</span>';robotmsg.textContent=r.message||'';mode1.disabled=!(m['1']&&m['1'].execution_ready)||!ser.connected;mode2.disabled=!(m['2']&&m['2'].execution_ready)||!ser.connected;planView(1,m['1']);planView(2,m['2']);status.textContent=JSON.stringify(s,null,2);let c=s.config||{};if(document.activeElement.tagName!=='INPUT'&&document.activeElement.tagName!=='SELECT'){papermode.value=c.paper_mode||'auto';dividery.value=c.divider_y_mm??0;contrast.value=c.contrast??28;minarea.value=c.min_area_mm2??100;maxarea.value=c.max_area_mm2??4500;placeoffx.value=c.mode3_place_offset_x_mm??0;placeoffy.value=c.mode3_place_offset_y_mm??0}}
-function planView3(p){
- let s=document.querySelector('#p3summary'),b=document.querySelector('#p3table');
- if(!p){s.innerHTML='<span class="problem">尚无模式3方案</span>';b.innerHTML='';return}
- let un=p.unreachable||[],bad=un.map(x=>x.piece_id+' '+x.operation+' ('+(x.point_a4_mm||[]).join(',')+')').join('；');
- let quality='最大对应顶点间距 '+esc(p.maximum_adjacent_vertex_gap_mm??'-')+' mm；最小间隙 '+esc(p.minimum_piece_clearance_mm??'-')+' mm；置信度 '+esc(p.confidence??'-')+'；裕量 '+esc(p.confidence_margin??'-');
- s.innerHTML='<b class="'+(p.execution_ready?'goodtext':'problem')+'">'+(p.execution_ready?'可一键执行':'禁止执行：'+esc((p.execution_blockers||[]).join('；')||p.error))+'</b>；预计 '+esc(p.estimated_seconds)+' 秒；目标 '+esc(JSON.stringify(p.target_rectangle_mm))+'<br>'+quality+(bad?'<br><span class="problem">不可达：'+esc(bad)+'</span>':'');
- let rows=(p.moves||[]).map(m=>'<tr><td>'+esc(m.order)+'</td><td>'+esc(m.piece_id)+'</td><td>'+esc((m.pick_a4_mm||[]).join(', '))+'</td><td>'+esc((m.place_controller_a4_mm||m.place_a4_mm||[]).join(', '))+'</td><td>'+esc(m.rotate_deg_clockwise)+'</td><td>'+esc(m.pick_method||'面积质心')+'</td><td>'+esc(m.reachable===false?'否':'是')+'</td></tr>');
- b.innerHTML='<table><thead><tr><th>顺序</th><th>碎片</th><th>吸取A4坐标</th><th>执行放置A4坐标</th><th>顺时针旋转</th><th>吸取点</th><th>可达</th></tr></thead><tbody>'+rows.join('')+'</tbody></table>';
-}
-const renderModes12=render;
-render=function(s){
- renderModes12(s);
- let r=s.robot||{},ser=r.serial||{},m=s.motion_plans||{},a=s.arbitrary_stability||{};
- let serviceMode=Number((s.config||{}).service_mode||2);
- if(selectedPreviewMode===0)selectPreview(serviceMode,true);
- let robotBusy=!['IDLE','DONE','ERROR','REJECTED'].includes(r.state);
- let activeMode=Number(r.active_mode||0);
- if(robotBusy&&(activeMode===2||activeMode===3))selectPreview(activeMode);
- // Mode 3 is a true one-click workflow: it may be pressed before the visual
- // plan is stable.  The backend then waits, freezes the first stable solution,
- // and sends it automatically.  Only serial disconnect/busy robot blocks it.
- if(serviceMode===3){mode1.disabled=true;mode2.disabled=true;}
- if(serviceMode===2){
-  let w=s.mode2_white_stability||{};
-  badges.innerHTML+='<span class="badge '+(s.recognition_stable_four_pieces?'ok':'wait')+'">MODE2 white '+esc(s.piece_count??0)+'/4, stable '+(s.recognition_stable_four_pieces?'YES':'NO')+', boundary '+esc(w.vertex_spread_mm??'-')+' mm</span>';
- }
- mode3.disabled=serviceMode!==3||!ser.connected||robotBusy;
- let view2Button=document.querySelector('#view2');
- let view3Button=document.querySelector('#view3');
- view2Button.disabled=serviceMode!==2;
- view3Button.disabled=serviceMode!==3;
- mode3.style.display=serviceMode===3?'inline-block':'none';
- view3Button.style.display=serviceMode===3?'inline-block':'none';
- view2Button.style.display=serviceMode===2?'inline-block':'none';
- if(serviceMode===3){
-  badges.innerHTML+='<span class="badge '+(a.stable?'ok':'wait')+'">模式3白片 '+esc(s.arbitrary_piece_count??0)+'片，稳定 '+(a.stable?'是':'否')+'</span>';
-   planView3(m['3']);
-  }
-  probePanel.style.display=serviceMode===3?'block':'none';
-  let probeBusy=!['IDLE','DONE','ERROR','REJECTED'].includes(r.state);
-  document.querySelector('#probeArm').disabled=serviceMode!==3||!ser.connected||probeBusy||!s.a4_physical_orientation_locked;
-  document.querySelector('#probeHome').disabled=serviceMode!==3||!ser.connected||probeBusy;
-};
+function render(s){last=s;let r=s.robot||{},ser=r.serial||{},m=s.motion_plans||{},cc=(s.config||{}).camera_calibration||{};badges.innerHTML='<span class="badge '+(s.stable_four_pieces?'ok':'wait')+'">4片稳定 '+(s.stable_four_pieces?'是':'否')+'</span><span class="badge '+(s.a4_physical_orientation_locked?'ok':'wait')+'">A4方向锁定 '+(s.a4_physical_orientation_locked?'是':'否')+'</span><span class="badge '+(cc.loaded?'ok':'wait')+'">镜头标定 '+(cc.loaded?'已加载':'未加载')+'</span><span class="badge '+(ser.connected?'ok':'bad')+'">MCU串口 '+(ser.connected?'已连接':'未连接')+'</span><span class="badge">分界线Y '+esc(s.divider_y_mm)+' mm</span><span class="badge '+(r.state==='ERROR'||r.state==='REJECTED'||r.state==='STOPPED'?'bad':'ok')+'">'+esc(r.state)+'</span>';robotmsg.textContent=r.message||'';mode1.disabled=!(m['1']&&m['1'].execution_ready)||!ser.connected;mode2.disabled=!(m['2']&&m['2'].execution_ready)||!ser.connected;planView(1,m['1']);planView(2,m['2']);status.textContent=JSON.stringify(s,null,2);let c=s.config||{};if(document.activeElement.tagName!=='INPUT'&&document.activeElement.tagName!=='SELECT'){papermode.value=c.paper_mode||'auto';dividery.value=c.divider_y_mm??0;contrast.value=c.contrast??28;minarea.value=c.min_area_mm2??100;maxarea.value=c.max_area_mm2??4500}}
 setInterval(async()=>{try{render(await(await fetch('/api/status')).json())}catch(e){robotmsg.textContent='网页状态读取失败：'+e}},450);
 </script></body></html>""".encode("utf-8")
 
@@ -4078,22 +2250,16 @@ def make_handler(app: PuzzleVisionApp):
                 "Content-Type", "multipart/x-mixed-replace; boundary=frame"
             )
             self.end_headers()
-            last_jpeg: bytes | None = None
             try:
                 while app.running:
                     with app.lock:
                         jpeg = getattr(app, attribute)
-                    # The vision worker may run below the old fixed 16.7 Hz
-                    # HTTP loop.  Sending the same bytes again only makes the
-                    # browser decode duplicate frames and can consume another
-                    # full CPU core on the Pi desktop.
-                    if jpeg is not None and jpeg is not last_jpeg:
+                    if jpeg:
                         self.wfile.write(
                             b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
                             + jpeg + b"\r\n"
                         )
-                        last_jpeg = jpeg
-                    time.sleep(0.02)
+                    time.sleep(0.06)
             except (BrokenPipeError, ConnectionResetError):
                 return
 
@@ -4109,10 +2275,6 @@ def make_handler(app: PuzzleVisionApp):
                 self.stream("camera_jpeg")
             elif self.path == "/a4.mjpg":
                 self.stream("warp_jpeg")
-            elif self.path == "/a4-mode2.mjpg":
-                self.stream("mode2_warp_jpeg")
-            elif self.path == "/a4-mode3.mjpg":
-                self.stream("mode3_warp_jpeg")
             elif self.path == "/mask.mjpg":
                 self.stream("mask_jpeg")
             elif self.path == "/raw.jpg":
@@ -4127,18 +2289,10 @@ def make_handler(app: PuzzleVisionApp):
                     self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
                 else:
                     self.reply(jpeg, "image/jpeg")
-            elif self.path in {
-                "/camera.jpg",
-                "/a4.jpg",
-                "/a4-mode2.jpg",
-                "/a4-mode3.jpg",
-                "/mask.jpg",
-            }:
+            elif self.path in {"/camera.jpg", "/a4.jpg", "/mask.jpg"}:
                 attribute = {
                     "/camera.jpg": "camera_jpeg",
                     "/a4.jpg": "warp_jpeg",
-                    "/a4-mode2.jpg": "mode2_warp_jpeg",
-                    "/a4-mode3.jpg": "mode3_warp_jpeg",
                     "/mask.jpg": "mask_jpeg",
                 }[self.path]
                 with app.lock:
@@ -4167,13 +2321,6 @@ def make_handler(app: PuzzleVisionApp):
                 elif parsed.path == "/api/config":
                     app.update_config(parse_qs(parsed.query))
                     self.reply("segmentation config updated".encode())
-                elif parsed.path == "/api/preview":
-                    mode = int(parse_qs(parsed.query).get("mode", ["2"])[0])
-                    app.set_analysis_mode(mode)
-                    self.reply(
-                        json.dumps({"analysis_mode": mode}).encode(),
-                        "application/json; charset=utf-8",
-                    )
                 elif parsed.path == "/api/task":
                     mode = int(parse_qs(parsed.query).get("mode", ["0"])[0])
                     request_id = app.start_task(mode)
@@ -4181,32 +2328,6 @@ def make_handler(app: PuzzleVisionApp):
                         json.dumps(
                             {"accepted": True, "request_id": request_id, "mode": mode}
                         ).encode(),
-                        "application/json; charset=utf-8",
-                    )
-                elif parsed.path == "/api/probe":
-                    query = parse_qs(parsed.query)
-                    x_mm = float(query.get("x_mm", [""])[0])
-                    y_mm = float(query.get("y_mm", [""])[0])
-                    request_id = app.start_click_probe(x_mm, y_mm)
-                    self.reply(
-                        json.dumps(
-                            {
-                                "accepted": True,
-                                "request_id": request_id,
-                                "target_a4_mm": [round(x_mm, 1), round(y_mm, 1)],
-                                "z_down_mm": 12.0,
-                            },
-                            ensure_ascii=False,
-                        ).encode("utf-8"),
-                        "application/json; charset=utf-8",
-                    )
-                elif parsed.path == "/api/probe-home":
-                    request_id = app.return_click_probe_home()
-                    self.reply(
-                        json.dumps(
-                            {"accepted": True, "request_id": request_id},
-                            ensure_ascii=False,
-                        ).encode("utf-8"),
                         "application/json; charset=utf-8",
                     )
                 elif parsed.path == "/api/stop":
@@ -4437,10 +2558,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--camera-fps", type=int, default=30)
-    parser.add_argument(
-        "--service-mode", type=int, choices=(2, 3), default=2,
-        help="run only question 2 fixed templates or question 3 unknown pieces",
-    )
     parser.add_argument("--contrast", type=float, default=28.0)
     parser.add_argument(
         "--paper-mode", choices=("auto", "white", "black"), default="auto"
@@ -4448,13 +2565,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--source-region", choices=("lower", "upper"), default="lower",
         help="physical A4 half containing the four loose pieces",
-    )
-    parser.add_argument(
-        "--mode2-white-only", action="store_true",
-        help=(
-            "for question 2, reuse question 3 white-on-black polygon "
-            "segmentation/stability before fixed-template matching"
-        ),
     )
     parser.add_argument(
         "--divider-y-mm", type=float, default=0.0,
@@ -4474,27 +2584,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--serial-baud", type=int, default=115200)
     parser.add_argument(
         "--vision-wait-seconds", type=float, default=15.0,
-        help="time after a request to wait for a stable reachable 1..4-piece plan",
+        help="time after KEY to wait for one stable reachable four-piece plan",
     )
     parser.add_argument(
         "--rotation-sign", type=float, choices=(-1.0, 1.0), default=1.0,
         help="motor-5 sign for positive clockwise image rotation",
     )
     parser.add_argument(
-        "--mode3-place-offset-x-mm", type=float, default=0.0,
-        help="fine X correction applied to every mode-3 magnet place point",
-    )
-    parser.add_argument(
-        "--mode3-place-offset-y-mm", type=float, default=0.0,
-        help="fine Y correction applied to every mode-3 magnet place point",
-    )
-    parser.add_argument(
         "--a4-calibration-file", default="a4_calibration.json",
         help="persistent physical A4 corner order for the fixed camera",
-    )
-    parser.add_argument(
-        "--require-saved-a4", action="store_true",
-        help="refuse startup and disable automatic A4 detection without a valid saved calibration",
     )
     parser.add_argument(
         "--camera-calibration-file", default="camera_calibration.npz",

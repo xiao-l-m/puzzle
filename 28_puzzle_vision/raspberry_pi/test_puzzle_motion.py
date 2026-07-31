@@ -256,21 +256,21 @@ class PuzzleMotionTests(unittest.TestCase):
 
     def test_stage_signs(self):
         calibration = StageCalibration()
-        self.assertEqual(calibration.a4_to_stage_mm([5, 61]), [0.0, 0.0])
+        self.assertEqual(calibration.a4_to_stage_mm([5, 63]), [0.0, 0.0])
         self.assertEqual(
-            calibration.a4_delta_to_motor_cm([5, 61], [205, 286]),
+            calibration.a4_delta_to_motor_cm([5, 63], [205, 288]),
             [-20.0, 22.5],
         )
 
     def test_submillimetre_vision_boundary_noise_is_clamped(self):
         calibration = StageCalibration()
-        point = calibration.clamp_visual_boundary_noise([159.6, 286.5])
+        point = calibration.clamp_visual_boundary_noise([159.6, 288.5])
         self.assertTrue(calibration.point_is_reachable(point))
         self.assertEqual(
             calibration.a4_to_stage_mm(point),
             [154.6, 225.0],
         )
-        far_point = calibration.clamp_visual_boundary_noise([159.6, 287.1])
+        far_point = calibration.clamp_visual_boundary_noise([159.6, 289.1])
         self.assertFalse(calibration.point_is_reachable(far_point))
 
     def test_motion_is_blocked_until_physical_a4_orientation_is_locked(self):
@@ -652,7 +652,7 @@ class PuzzleMotionTests(unittest.TestCase):
             [move["place_a4_mm"] for move in plan["moves"]], upper_targets
         )
         self.assertTrue(
-            all(61.0 <= point[1] < 150.0 for point in upper_targets)
+            all(62.0 <= point[1] < 150.0 for point in upper_targets)
         )
 
 

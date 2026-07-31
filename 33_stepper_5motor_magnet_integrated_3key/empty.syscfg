@@ -1,0 +1,91 @@
+/**
+ * @cliArgs --device "MSPM0G350X" --part "Default" --package "LQFP-64(PM)" --product "mspm0_sdk@2.10.00.04"
+ * @v2CliArgs --device "MSPM0G3507" --package "LQFP-64(PM)" --product "mspm0_sdk@2.10.00.04"
+ * @versions {"tool":"1.26.2+4477"}
+ */
+const GPIO    = scripting.addModule("/ti/driverlib/GPIO", {}, false);
+const LED     = GPIO.addInstance();
+const KEYIN   = GPIO.addInstance();
+const KEYS    = GPIO.addInstance();
+const MOS_CTRL = GPIO.addInstance();
+const UART    = scripting.addModule("/ti/driverlib/UART", {}, false);
+const UARTBUS = UART.addInstance();
+const UARTPI  = UART.addInstance();
+const SYSCTL  = scripting.addModule("/ti/driverlib/SYSCTL");
+
+UARTBUS.$name                    = "UART_BUS";
+UARTBUS.profile                  = "CONFIG_PROFILE_1";
+UARTBUS.peripheral.$assign       = "UART0";
+UARTBUS.targetBaudRate           = 115200;
+UARTBUS.enableInternalLoopback   = false;
+UARTBUS.enableFIFO               = false;
+UARTBUS.peripheral.rxPin.$assign = "PA11";
+UARTBUS.peripheral.txPin.$assign = "PA10";
+
+/* Raspberry Pi command/status link.  Keep this UART independent from the
+ * UART0 multidrop bus used by the five Emm motor drivers.
+ */
+UARTPI.$name                    = "UART_PI";
+UARTPI.profile                  = "CONFIG_PROFILE_1";
+UARTPI.peripheral.$assign       = "UART3";
+UARTPI.targetBaudRate           = 115200;
+UARTPI.enableInternalLoopback   = false;
+UARTPI.enabledInterrupts        = ["RX"];
+UARTPI.enableFIFO               = false;
+UARTPI.peripheral.rxPin.$assign = "PB13";
+UARTPI.peripheral.txPin.$assign = "PB12";
+
+LED.$name                         = "LED1";
+LED.associatedPins[0].$name       = "PIN_22";
+LED.associatedPins[0].pin.$assign = "PB22";
+
+KEYIN.$name                              = "KEY";
+KEYIN.associatedPins[0].$name            = "PIN_21";
+KEYIN.associatedPins[0].direction        = "INPUT";
+KEYIN.associatedPins[0].internalResistor = "PULL_UP";
+KEYIN.associatedPins[0].interruptEn      = true;
+KEYIN.associatedPins[0].polarity         = "FALL";
+KEYIN.associatedPins[0].pin.$assign      = "PB21";
+
+/* Existing external six-key module: pressed = low. */
+KEYS.$name                              = "KEYS";
+KEYS.associatedPins.create(6);
+KEYS.associatedPins[0].$name            = "KEY1";
+KEYS.associatedPins[0].direction        = "INPUT";
+KEYS.associatedPins[0].internalResistor = "PULL_UP";
+KEYS.associatedPins[0].pin.$assign      = "PB17";
+KEYS.associatedPins[1].$name            = "KEY2";
+KEYS.associatedPins[1].direction        = "INPUT";
+KEYS.associatedPins[1].internalResistor = "PULL_UP";
+KEYS.associatedPins[1].pin.$assign      = "PB18";
+KEYS.associatedPins[2].$name            = "KEY3";
+KEYS.associatedPins[2].direction        = "INPUT";
+KEYS.associatedPins[2].internalResistor = "PULL_UP";
+KEYS.associatedPins[2].pin.$assign      = "PB19";
+KEYS.associatedPins[3].$name            = "KEY4";
+KEYS.associatedPins[3].direction        = "INPUT";
+KEYS.associatedPins[3].internalResistor = "PULL_UP";
+KEYS.associatedPins[3].pin.$assign      = "PB20";
+KEYS.associatedPins[4].$name            = "KEY5";
+KEYS.associatedPins[4].direction        = "INPUT";
+KEYS.associatedPins[4].internalResistor = "PULL_UP";
+KEYS.associatedPins[4].pin.$assign      = "PB24";
+KEYS.associatedPins[5].$name            = "KEY6";
+KEYS.associatedPins[5].direction        = "INPUT";
+KEYS.associatedPins[5].internalResistor = "PULL_UP";
+KEYS.associatedPins[5].pin.$assign      = "PB25";
+
+/* Active-high MOS module input; stay safely low after reset. */
+MOS_CTRL.$name                                  = "MOS_CTRL";
+MOS_CTRL.associatedPins[0].$name                = "CONTROL";
+MOS_CTRL.associatedPins[0].initialValue         = "CLEARED";
+MOS_CTRL.associatedPins[0].internalResistor     = "PULL_DOWN";
+MOS_CTRL.associatedPins[0].pin.$assign          = "PA14";
+
+const Board = scripting.addModule("/ti/driverlib/Board", {}, false);
+
+SYSCTL.forceDefaultClkConfig = true;
+Board.peripheral.$suggestSolution          = "DEBUGSS";
+Board.peripheral.swclkPin.$suggestSolution = "PA20";
+Board.peripheral.swdioPin.$suggestSolution = "PA19";
+SYSCTL.peripheral.$suggestSolution         = "SYSCTL";

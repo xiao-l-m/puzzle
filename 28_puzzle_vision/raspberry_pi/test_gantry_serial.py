@@ -168,7 +168,113 @@ class UartConsoleConflictTests(unittest.TestCase):
                     link.close()
 
 
+class SerialHeartbeatValidationTests(unittest.TestCase):
+    def test_accepts_supported_mcu_responses(self):
+        decode = gantry_serial.GantrySerialLink._decode_protocol_line
+        for raw in (
+            b"READY GANTRY_V4_WEB_PROBE\r\n",
+            b"PONG READY\n",
+            b"STATE 7 MOVE\n",
+            b"ACK 7 COMMIT\n",
+            b"DONE 7\n",
+            b"ERR 0 BUSY\n",
+            b"KEY 1 2\n",
+            b"STATUS READY\n",
+        ):
+            self.assertIsNotNone(decode(raw), raw)
+
+    def test_rejects_noise_and_foreign_lines(self):
+        decode = gantry_serial.GantrySerialLink._decode_protocol_line
+        for raw in (
+            b"\xff\n",
+            b"\x00\n",
+            b"garbage\n",
+            b"\r\n",
+        ):
+            self.assertIsNone(decode(raw), raw)
+
+
 class GantryProtocolTests(unittest.TestCase):
+    def test_hardware_request_waits_for_frames_after_button_edge(self):
+        live_status = deepcopy(READY_STATUS)
+        live_status["vision_frame_index"] = 40
+
+        def status_provider():
+            return deepcopy(live_status)
+
+        with patch.object(gantry_serial, "GantrySerialLink", FakeSerialLink):
+            controller = GantryTaskController(
+                status_provider,
+                "/dev/fake-gantry",
+                115200,
+                vision_wait_seconds=1.0,
+            )
+            try:
+                controller.request_task(1, 7010, "TEST_KEY")
+                self.assertTrue(
+                    wait_until(
+                        lambda: controller.status()["state"]
+                        == "WAITING_VISION"
+                    )
+                )
+                self.assertEqual(controller.link.sent, [])
+                self.assertIn("0/8", controller.status()["message"])
+
+                # Seven new frames are deliberately insufficient.
+                live_status["vision_frame_index"] = 47
+                time.sleep(0.08)
+                self.assertEqual(controller.link.sent, [])
+
+                live_status["vision_frame_index"] = 48
+                self.assertTrue(
+                    wait_until(
+                        lambda: controller.status()["state"]
+                        == "WAITING_MCU"
+                    ),
+                    controller.status(),
+                )
+                snapshot = controller.status()["frozen_plan"]["vision_snapshot"]
+                self.assertEqual(snapshot["request_frame_index"], 40)
+                self.assertEqual(snapshot["frozen_frame_index"], 48)
+                self.assertEqual(snapshot["fresh_frames_after_request"], 8)
+            finally:
+                controller.close()
+
+    def test_click_probe_sends_metric_target_then_can_return_home(self):
+        with patch.object(gantry_serial, "GantrySerialLink", FakeSerialLink):
+            controller = GantryTaskController(
+                lambda: {}, "/dev/fake-gantry", 115200
+            )
+            try:
+                request_id = controller.request_probe(100.04, 200.06)
+                self.assertEqual(
+                    controller.link.sent[-1],
+                    f"PROBE {request_id} 1000 2001",
+                )
+                self.assertEqual(controller.status()["active_mode"], 4)
+                self.assertEqual(
+                    controller.status()["frozen_plan"]["z_down_mm"], 12.0
+                )
+                controller._on_serial_line(f"DONE {request_id}")
+                home_request = controller.request_probe_home()
+                self.assertEqual(
+                    controller.link.sent[-1], f"PROBEHOME {home_request}"
+                )
+            finally:
+                controller.close()
+
+    def test_click_probe_rejects_unreachable_point_without_sending(self):
+        with patch.object(gantry_serial, "GantrySerialLink", FakeSerialLink):
+            controller = GantryTaskController(
+                lambda: {}, "/dev/fake-gantry", 115200
+            )
+            try:
+                with self.assertRaisesRegex(ValueError, "outside reachable"):
+                    controller.request_probe(3.9, 200.0)
+                self.assertEqual(controller.link.sent, [])
+            finally:
+                controller.close()
+
     def test_item_line_uses_tenth_mm_and_millidegree_integers(self):
         move = {
             "pick_a4_mm": [12.34, 56.78],

@@ -16,6 +16,12 @@ class FirmwareProtocolContractTests(unittest.TestCase):
         cls.controller = (
             ROOT / "30_stepper_5motor_magnet_test" / "gantry_controller.c"
         ).read_text(encoding="utf-8")
+        cls.main = (
+            ROOT / "30_stepper_5motor_magnet_test" / "empty.c"
+        ).read_text(encoding="utf-8")
+        cls.syscfg = (
+            ROOT / "30_stepper_5motor_magnet_test" / "empty.syscfg"
+        ).read_text(encoding="utf-8")
 
     def test_plan_capacity_is_one_to_four(self) -> None:
         self.assertIn("GANTRY_MIN_PLAN_ITEMS         1U", self.config)
@@ -35,6 +41,23 @@ class FirmwareProtocolContractTests(unittest.TestCase):
         self.assertIn("rotationDeadline", self.controller)
         self.assertIn("xyDeadline", self.controller)
         self.assertIn("STATE_WAIT_PLACE_XY_ROTATE", self.controller)
+
+    def test_key2_starts_mode2_and_pb21_remains_emergency_stop(self) -> None:
+        self.assertIn("KEYS_KEY2_PIN", self.main)
+        self.assertIn("(uint8_t)(index + 1U)", self.main)
+        self.assertIn("KEY_PIN_21_PIN", self.main)
+        self.assertIn('GantryController_EmergencyStop("PB21")', self.main)
+        self.assertIn(
+            'KEYS.associatedPins[1].pin.$assign      = "PB18"',
+            self.syscfg,
+        )
+
+    def test_board_led_distinguishes_active_complete_and_fault(self) -> None:
+        self.assertIn("LED1_PIN_22_PIN", self.main)
+        self.assertIn("GantryController_IsIdle()", self.main)
+        self.assertIn("COMPLETE_LED_HALF_PERIOD_MS 500U", self.main)
+        self.assertIn("REJECT_LED_HALF_PERIOD_MS   200U", self.main)
+        self.assertIn("GantryController_TakeCompletionEvent()", self.main)
 
 
 if __name__ == "__main__":

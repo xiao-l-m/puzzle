@@ -27,17 +27,17 @@ class StageCalibration:
     """Fixed relationship between the A4 sheet and the slide start position."""
 
     # Current measured start: magnet centre is 5 mm from the A4 left edge and
-    # 61 mm from the A4 top edge.
+    # 63 mm from the A4 top edge.
     home_x_a4_mm: float = 5.0
-    home_y_a4_mm: float = 61.0
+    home_y_a4_mm: float = 63.0
 
     # Measured usable travel: X=200 mm, Y=225 mm.
     x_min_a4_mm: float = 5.0
     x_max_a4_mm: float = 205.0
-    y_min_a4_mm: float = 61.0
-    y_max_a4_mm: float = 286.0
+    y_min_a4_mm: float = 63.0
+    y_max_a4_mm: float = 288.0
 
-    z_pick_drop_mm: float = 8.0
+    z_pick_drop_mm: float = 12.0
     rotation_sign: float = 1.0
     vision_boundary_tolerance_mm: float = 1.0
     # Fine correction from ideal visual placement to the real magnet centre.
@@ -1589,7 +1589,7 @@ def estimate_plan_seconds(
     if not plan.get("moves"):
         return 0.0
     z_motion_seconds = _profile_duration_seconds(
-        distance_revolutions=8.0 / 4.0,
+        distance_revolutions=12.0 / 4.0,
         speed_rpm=220.0,
         acceleration_level=220,
     )

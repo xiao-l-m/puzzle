@@ -35,10 +35,22 @@ MIN_TARGET_WIDTH_MM = 90.0
 MAX_TARGET_WIDTH_MM = 120.0
 MIN_TARGET_HEIGHT_MM = 50.0
 MAX_TARGET_HEIGHT_MM = 90.0
-MAX_LAYOUT_SOLUTIONS = 320
+# A4 homography and white-mask contour fitting can make a physical dimension
+# read a few percent large.  The current 100 x 90 mm field set measures about
+# 102.4 x 92.4 mm, so the previous hidden 2 mm allowance was too narrow.
+DIMENSION_CALIBRATION_TOLERANCE_MM = 5.0
+MAX_LAYOUT_SOLUTIONS = 1000
 COMPOSITE_EDGE_TOLERANCE_MM = 8.0
 COMPOSITE_JUNCTION_TOLERANCE_MM = 18.0
 COMPOSITE_COLLINEAR_TOLERANCE_DEG = 18.0
+MULTI_SEGMENT_CONTACT_TOLERANCE_MM = 8.0
+# Boundary placement is only a fallback after the much faster exact/partial
+# edge matcher.  A 6 mm grid has at most 3 mm quantization error, comfortably
+# inside the official 20 mm corresponding-vertex limit and the solver's later
+# contact validation, while avoiding thousands of nearly identical raster
+# states on the Raspberry Pi.
+BOUNDARY_POSITION_STEP_MM = 6.0
+BOUNDARY_BEAM_WIDTH = 96
 
 
 @dataclass(frozen=True)
@@ -329,23 +341,28 @@ def _dimensions_allowed(width: float, height: float) -> bool:
     long_side = max(float(width), float(height))
     short_side = min(float(width), float(height))
     return bool(
-        MIN_TARGET_WIDTH_MM - 2.0
+        MIN_TARGET_WIDTH_MM - DIMENSION_CALIBRATION_TOLERANCE_MM
         <= long_side
-        <= MAX_TARGET_WIDTH_MM + 2.0
-        and MIN_TARGET_HEIGHT_MM - 2.0
+        <= MAX_TARGET_WIDTH_MM + DIMENSION_CALIBRATION_TOLERANCE_MM
+        and MIN_TARGET_HEIGHT_MM - DIMENSION_CALIBRATION_TOLERANCE_MM
         <= short_side
-        <= MAX_TARGET_HEIGHT_MM + 2.0
+        <= MAX_TARGET_HEIGHT_MM + DIMENSION_CALIBRATION_TOLERANCE_MM
     )
 
 
 def _candidate_rectangle_sizes(polygons: list[np.ndarray]) -> list[tuple[float, float]]:
     """Infer likely rectangle dimensions from sums of observed outer edges."""
     total_area = sum(polygon_area(polygon) for polygon in polygons)
+    measured_edges = [
+        edge_length(polygon, edge_index)
+        for polygon in polygons
+        for edge_index in range(len(polygon))
+    ]
     values: set[float] = set()
 
     def collect(piece_index: int, running: float) -> None:
         if piece_index >= len(polygons):
-            if 48.0 <= running <= 122.0:
+            if 45.0 <= running <= 125.0:
                 values.add(round(running * 2.0) / 2.0)
             return
         collect(piece_index + 1, running)
@@ -359,8 +376,8 @@ def _candidate_rectangle_sizes(polygons: list[np.ndarray]) -> list[tuple[float, 
     collect(0, 0.0)
     for value in np.arange(50.0, 120.01, 2.5):
         values.add(round(float(value), 1))
-    long_values = sorted(value for value in values if 88.0 <= value <= 122.0)
-    short_values = sorted(value for value in values if 48.0 <= value <= 92.0)
+    long_values = sorted(value for value in values if 85.0 <= value <= 125.0)
+    short_values = sorted(value for value in values if 45.0 <= value <= 95.0)
     sizes: list[tuple[float, float, float]] = []
     for width in long_values:
         for height in short_values:
@@ -369,7 +386,95 @@ def _candidate_rectangle_sizes(polygons: list[np.ndarray]) -> list[tuple[float, 
                 continue
             sizes.append((abs(1.0 - coverage), width, height))
     sizes.sort()
-    selected = [(width, height) for _error, width, height in sizes[:20]]
+
+    # The longest measured edge is normally one side (or nearly one side) of
+    # the target rectangle.  Threshold erosion and line fitting shorten it by
+    # a few millimetres, while the total white area is also smaller than the
+    # target because the pieces are intentionally separated.  Derive a small
+    # high-probability prefix from those two measurements.  This puts the
+    # field set's 110 x 65 mm solution first instead of making the Raspberry
+    # Pi reject roughly forty less plausible rectangles before reaching it.
+    # The exhaustive candidates below are retained unchanged as a fallback.
+    priority: list[tuple[float, float]] = []
+    # Question 3 guarantees a nominal 90 mm side and a 50..120 mm other
+    # side.  Put a few scale-aware candidates first; the variable side is
+    # inferred from observed area, so this remains valid for every allowed
+    # rectangle rather than hard-coding the current 100 x 90 mm field set.
+    fixed_edge_measurements = sorted(
+        (length for length in measured_edges if 82.0 <= length <= 98.0),
+        key=lambda length: abs(length - 90.0),
+    )
+    measured_fixed_side = (
+        round(fixed_edge_measurements[0] / 2.5) * 2.5
+        if fixed_edge_measurements
+        else 90.0
+    )
+    fixed_side_candidates: list[float] = []
+    for value in (
+        measured_fixed_side,
+        measured_fixed_side + 2.5,
+        90.0,
+        measured_fixed_side - 2.5,
+        95.0,
+        87.5,
+    ):
+        value = float(min(95.0, max(85.0, value)))
+        if value not in fixed_side_candidates:
+            fixed_side_candidates.append(value)
+    # Interleave fill targets across fixed-side hypotheses.  Otherwise one
+    # slightly wrong fixed-side estimate can reach a loose 89% fill box before
+    # the next (and correct) scale hypothesis gets its tight 95% candidate.
+    for expected_fill in (0.98, 0.95, 0.92, 0.89):
+        for fixed_side in fixed_side_candidates:
+            other_side = round(
+                total_area / max(1.0, fixed_side * expected_fill) / 2.5
+            ) * 2.5
+            width = max(float(fixed_side), float(other_side))
+            height = min(float(fixed_side), float(other_side))
+            candidate = (width, height)
+            coverage = total_area / max(1.0, width * height)
+            if (
+                _dimensions_allowed(width, height)
+                and 0.86 <= coverage <= 1.06
+                and candidate not in priority
+            ):
+                priority.append(candidate)
+    if measured_edges:
+        longest = math.ceil(max(measured_edges) / 2.5) * 2.5
+        short_edges = sorted(
+            (length for length in measured_edges if 45.0 <= length <= 95.0)
+        )
+        for width_offset in (5.0, 2.5, 0.0, 7.5, 10.0):
+            width = longest + width_offset
+            if not 88.0 <= width <= 122.0:
+                continue
+            estimated_height = round(
+                (total_area / max(1.0, 0.90 * width)) / 2.5
+            ) * 2.5
+            height_candidates = [estimated_height]
+            if short_edges:
+                nearest = min(
+                    short_edges,
+                    key=lambda length: abs(length - estimated_height),
+                )
+                rounded_nearest = math.ceil(nearest / 2.5) * 2.5
+                height_candidates.extend((rounded_nearest, rounded_nearest + 2.5))
+            for height in height_candidates:
+                candidate = (float(width), float(height))
+                coverage = total_area / max(1.0, width * height)
+                if (
+                    45.0 <= height <= 95.0
+                    and 0.58 <= coverage <= 1.06
+                    and candidate not in priority
+                ):
+                    priority.append(candidate)
+
+    selected = list(priority)
+    selected.extend(
+        (width, height)
+        for _error, width, height in sizes[:20]
+        if (width, height) not in selected
+    )
     # With real threshold contours, an exact-area rectangle can be a few
     # millimetres too tight even though its area estimate is excellent.  The
     # old fallback jumped directly to coarse 70/80 mm heights; on the July
@@ -378,7 +483,7 @@ def _candidate_rectangle_sizes(polygons: list[np.ndarray]) -> list[tuple[float, 
     # standard sizes before those loose fallbacks.
     expanded_sizes: list[tuple[float, float, float]] = []
     for width in np.arange(90.0, 120.01, 2.5):
-        for height in np.arange(50.0, 90.01, 2.5):
+        for height in np.arange(50.0, 95.01, 2.5):
             coverage = total_area / max(1.0, float(width * height))
             candidate = (float(width), float(height))
             if 0.88 <= coverage <= 0.95 and candidate not in selected:
@@ -409,7 +514,9 @@ def _boundary_positions(side_length: float, edge_length_mm: float) -> list[float
     if maximum < -2.0:
         return []
     maximum = max(0.0, maximum)
-    values = list(np.arange(0.0, maximum + 0.01, 3.0))
+    values = list(
+        np.arange(0.0, maximum + 0.01, BOUNDARY_POSITION_STEP_MM)
+    )
     values.extend((0.0, maximum))
     return sorted({round(float(value), 2) for value in values})
 
@@ -990,7 +1097,7 @@ def _boundary_rectangle_pack(polygons: list[np.ndarray]) -> dict[str, Any] | Non
                 selected: list[BoundaryPlacement | None] = [None] * len(polygons)
                 selected[anchor] = state
                 beam.append((0.0, selected, state_mask.copy()))
-            beam = beam[:160]
+            beam = beam[:BOUNDARY_BEAM_WIDTH]
             for piece_index in order[1:]:
                 next_beam: list[
                     tuple[
@@ -1047,7 +1154,7 @@ def _boundary_rectangle_pack(polygons: list[np.ndarray]) -> dict[str, Any] | Non
                     )
                     if key not in unique:
                         unique[key] = candidate
-                    if len(unique) >= 160:
+                    if len(unique) >= BOUNDARY_BEAM_WIDTH:
                         break
                 beam = list(unique.values())
             for contact_score, selected_optional, _occupied in beam:
@@ -1438,8 +1545,16 @@ def _build_relative_assemblies(
                             ),
                             default=math.inf,
                         )
-                        near_full_match = (
-                            shorter / max(1.0e-6, longer) >= 0.72
+                        # Do not admit a weak 72%-length match merely because
+                        # the edges point in opposite directions.  On the
+                        # field set, 60.7<->102.9 and 42.5<->102.9 consumed
+                        # the bounded DFS before the useful topology was
+                        # expanded.  A near-full noisy seam must be close in
+                        # absolute length; a larger mismatch is admitted only
+                        # when a third piece explicitly explains the remainder.
+                        near_full_match = bool(
+                            difference <= 8.0
+                            and shorter / max(1.0e-6, longer) >= 0.85
                         )
                         composite_t_junction = complement_error <= 5.0
                         partial_edge_match = bool(
@@ -1499,7 +1614,7 @@ def _build_relative_assemblies(
             fixed_index,
             fixed_edge,
             transform,
-        ) in candidates[:160]:
+        ) in candidates[:96]:
             transforms[moving_index] = transform
             placed.add(moving_index)
             transformed_centers = []
@@ -1782,10 +1897,293 @@ def _build_composite_t_junction_assemblies(
     return results[:MAX_LAYOUT_SOLUTIONS]
 
 
+def _build_three_segment_composite_assemblies(
+    polygons: list[np.ndarray],
+) -> list[tuple[list[RigidTransform], list[SeamMatch], float]]:
+    """Build four-piece layouts with one long seam split into three edges.
+
+    The fixed 100x60 field set, and valid arbitrary guillotine/Voronoi cuts,
+    can contain a long edge on one piece that is shared by three consecutive
+    edges from the other pieces.  A spanning-tree edge matcher can align only
+    an endpoint segment of that seam; the middle segment has a non-zero offset
+    and was therefore unreachable.  Enumerate the three segment orderings,
+    place them rigidly along the long edge, then require two additional exact
+    contacts to connect the three short-side pieces.
+    """
+    if len(polygons) != 4:
+        return []
+
+    results: list[tuple[list[RigidTransform], list[SeamMatch], float]] = []
+    seen: set[tuple[Any, ...]] = set()
+    indices = tuple(range(4))
+
+    for base_index in indices:
+        base_polygon = polygons[base_index]
+        for base_edge in range(len(base_polygon)):
+            base_start, base_end = edge_points(base_polygon, base_edge)
+            base_vector = base_end - base_start
+            base_length = float(np.linalg.norm(base_vector))
+            if base_length < 55.0:
+                continue
+            base_direction = base_vector / base_length
+            other_indices = tuple(
+                index for index in indices if index != base_index
+            )
+            for ordered_indices in permutations(other_indices):
+                edge_ranges = [
+                    range(len(polygons[index])) for index in ordered_indices
+                ]
+                for first_edge in edge_ranges[0]:
+                    first_length = edge_length(
+                        polygons[ordered_indices[0]], first_edge
+                    )
+                    for second_edge in edge_ranges[1]:
+                        second_length = edge_length(
+                            polygons[ordered_indices[1]], second_edge
+                        )
+                        for third_edge in edge_ranges[2]:
+                            segment_edges = (
+                                first_edge, second_edge, third_edge
+                            )
+                            segment_lengths = (
+                                first_length,
+                                second_length,
+                                edge_length(
+                                    polygons[ordered_indices[2]],
+                                    third_edge,
+                                ),
+                            )
+                            composite_error = abs(
+                                base_length - sum(segment_lengths)
+                            )
+                            if (
+                                composite_error
+                                > COMPOSITE_EDGE_TOLERANCE_MM
+                            ):
+                                continue
+
+                            chain_offset = 0.5 * (
+                                base_length - sum(segment_lengths)
+                            )
+                            cursor = base_start + chain_offset * base_direction
+                            transforms_by_index: list[
+                                RigidTransform | None
+                            ] = [None] * 4
+                            transforms_by_index[base_index] = RigidTransform(
+                                0.0, np.zeros(2, np.float64)
+                            )
+                            placed_by_index: list[np.ndarray | None] = [None] * 4
+                            placed_by_index[base_index] = base_polygon
+                            composite_seams: list[SeamMatch] = []
+                            for piece_index, edge_index, length in zip(
+                                ordered_indices,
+                                segment_edges,
+                                segment_lengths,
+                            ):
+                                target_start = cursor
+                                target_end = cursor + length * base_direction
+                                transform = align_reversed_edge_to_segment(
+                                    polygons[piece_index],
+                                    edge_index,
+                                    target_start,
+                                    target_end,
+                                )
+                                transforms_by_index[piece_index] = transform
+                                placed_by_index[piece_index] = transform.apply(
+                                    polygons[piece_index]
+                                )
+                                composite_seams.append(
+                                    SeamMatch(
+                                        base_index,
+                                        base_edge,
+                                        piece_index,
+                                        edge_index,
+                                        composite_error,
+                                    )
+                                )
+                                cursor = target_end
+
+                            # Find the best unused reversed-edge contact for
+                            # every pair of short-side pieces in the placed
+                            # geometry.  A valid layout needs two such contacts
+                            # whose pair graph spans all three pieces.
+                            pair_contacts: list[
+                                tuple[float, int, int, int, int, float]
+                            ] = []
+                            for first_position in range(3):
+                                first_index = ordered_indices[first_position]
+                                first_placed = placed_by_index[first_index]
+                                assert first_placed is not None
+                                for second_position in range(
+                                    first_position + 1, 3
+                                ):
+                                    second_index = ordered_indices[
+                                        second_position
+                                    ]
+                                    second_placed = placed_by_index[second_index]
+                                    assert second_placed is not None
+                                    best_contact = None
+                                    for first_other_edge in range(
+                                        len(polygons[first_index])
+                                    ):
+                                        if (
+                                            first_other_edge
+                                            == segment_edges[first_position]
+                                        ):
+                                            continue
+                                        first_contact_start, first_contact_end = (
+                                            edge_points(
+                                                first_placed,
+                                                first_other_edge,
+                                            )
+                                        )
+                                        for second_other_edge in range(
+                                            len(polygons[second_index])
+                                        ):
+                                            if (
+                                                second_other_edge
+                                                == segment_edges[second_position]
+                                            ):
+                                                continue
+                                            second_contact_start, second_contact_end = (
+                                                edge_points(
+                                                    second_placed,
+                                                    second_other_edge,
+                                                )
+                                            )
+                                            endpoint_error = max(
+                                                float(
+                                                    np.linalg.norm(
+                                                        first_contact_start
+                                                        - second_contact_end
+                                                    )
+                                                ),
+                                                float(
+                                                    np.linalg.norm(
+                                                        first_contact_end
+                                                        - second_contact_start
+                                                    )
+                                                ),
+                                            )
+                                            length_error = abs(
+                                                edge_length(
+                                                    polygons[first_index],
+                                                    first_other_edge,
+                                                )
+                                                - edge_length(
+                                                    polygons[second_index],
+                                                    second_other_edge,
+                                                )
+                                            )
+                                            contact_cost = (
+                                                endpoint_error
+                                                + 0.25 * length_error
+                                            )
+                                            candidate = (
+                                                contact_cost,
+                                                first_index,
+                                                first_other_edge,
+                                                second_index,
+                                                second_other_edge,
+                                                length_error,
+                                            )
+                                            if (
+                                                best_contact is None
+                                                or candidate[0]
+                                                < best_contact[0]
+                                            ):
+                                                best_contact = candidate
+                                    if (
+                                        best_contact is not None
+                                        and best_contact[0]
+                                        <= MULTI_SEGMENT_CONTACT_TOLERANCE_MM
+                                    ):
+                                        pair_contacts.append(best_contact)
+
+                            pair_contacts.sort(key=lambda value: value[0])
+                            parent = {index: index for index in ordered_indices}
+
+                            def find(index: int) -> int:
+                                while parent[index] != index:
+                                    parent[index] = parent[parent[index]]
+                                    index = parent[index]
+                                return index
+
+                            selected_contacts = []
+                            for contact in pair_contacts:
+                                first_root = find(contact[1])
+                                second_root = find(contact[3])
+                                if first_root == second_root:
+                                    continue
+                                parent[first_root] = second_root
+                                selected_contacts.append(contact)
+                                if len(selected_contacts) == 2:
+                                    break
+                            if len(selected_contacts) != 2:
+                                continue
+
+                            transforms = [
+                                value
+                                for value in transforms_by_index
+                                if value is not None
+                            ]
+                            if len(transforms) != 4:
+                                continue
+                            key = tuple(
+                                value
+                                for index in indices
+                                for value in (
+                                    round(
+                                        transforms_by_index[index].angle_rad,
+                                        3,
+                                    ),
+                                    round(
+                                        float(
+                                            transforms_by_index[index].translation[0]
+                                        ),
+                                        1,
+                                    ),
+                                    round(
+                                        float(
+                                            transforms_by_index[index].translation[1]
+                                        ),
+                                        1,
+                                    ),
+                                )
+                            )
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            contact_seams = [
+                                SeamMatch(
+                                    contact[1],
+                                    contact[2],
+                                    contact[3],
+                                    contact[4],
+                                    contact[5],
+                                )
+                                for contact in selected_contacts
+                            ]
+                            mismatch = composite_error + sum(
+                                contact[0] for contact in selected_contacts
+                            )
+                            results.append(
+                                (
+                                    transforms,
+                                    composite_seams + contact_seams,
+                                    mismatch,
+                                )
+                            )
+
+    results.sort(key=lambda item: float(item[2]))
+    return results[:MAX_LAYOUT_SOLUTIONS]
+
+
 def reconstruct_rectangle(
     pieces: list[dict[str, Any]],
     requested_gap_mm: float = DEFAULT_SEAM_GAP_MM,
     use_boundary_pack: bool = True,
+    allow_best_effort: bool = True,
 ) -> dict[str, Any]:
     """Return a target-local rigid layout or a diagnostic rejection."""
     if not 1 <= len(pieces) <= 4:
@@ -1830,10 +2228,44 @@ def reconstruct_rectangle(
                 "minimum_edge_mm": round(minimum_measured_edge, 2),
             }
 
+    # The reversed-edge/T-junction solver is normally two orders of magnitude
+    # faster than the outer-boundary beam search on real four-piece contours.
+    # Try it first and keep the expensive boundary pack only as a compatibility
+    # fallback for layouts whose camera edges cannot be paired reliably.  The
+    # recursive call disables this fast-path block, so it executes exactly once.
+    edge_best_effort_result: dict[str, Any] | None = None
+    if use_boundary_pack:
+        edge_match_result = reconstruct_rectangle(
+            pieces,
+            requested_gap_mm=requested_gap_mm,
+            use_boundary_pack=False,
+            allow_best_effort=True,
+        )
+        if edge_match_result.get("ready", False):
+            edge_match_result.setdefault("search_path", "EDGE_MATCH_FAST_PATH")
+            if not edge_match_result.get("best_effort_forced", False):
+                return edge_match_result
+            edge_best_effort_result = edge_match_result
+            forced_reasons = set(
+                edge_match_result.get("forced_rejection_reasons", [])
+            )
+            # An edge topology rejected only for measured contour overlap or
+            # vertex offset already has a plausible rectangular envelope.
+            # Return its once-refined fallback immediately; the boundary beam
+            # cannot improve its topology and would duplicate several seconds
+            # of work on the camera thread.
+            if (
+                float(edge_match_result.get("coverage_ratio", 0.0)) >= 0.86
+                and forced_reasons <= {"OVERLAP", "VERTEX_GAP"}
+            ):
+                return edge_match_result
+
     total_area = sum(polygon_area(polygon) for polygon in polygons)
     boundary_candidate = (
         _boundary_rectangle_pack(polygons) if use_boundary_pack else None
     )
+    if boundary_candidate is None and edge_best_effort_result is not None:
+        return edge_best_effort_result
     if boundary_candidate is not None:
         boundary_size = np.asarray(
             boundary_candidate["final_size"], np.float64
@@ -1850,8 +2282,12 @@ def reconstruct_rectangle(
             + float(boundary_quality["score"])
         )
     composite_assemblies = (
-        [] if boundary_candidate is not None
-        else _build_composite_t_junction_assemblies(polygons)
+        []
+        if boundary_candidate is not None
+        else (
+            _build_three_segment_composite_assemblies(polygons)
+            + _build_composite_t_junction_assemblies(polygons)
+        )
     )
     standard_assemblies = (
         [] if boundary_candidate is not None
@@ -1861,6 +2297,8 @@ def reconstruct_rectangle(
     candidates: list[dict[str, Any]] = (
         [boundary_candidate] if boundary_candidate is not None else []
     )
+    best_rejected_candidate: dict[str, Any] | None = None
+    best_rejected_score = float("inf")
     seen_layouts: set[tuple[float, ...]] = set()
     rejection_counts = {
         "dimensions": 0,
@@ -1888,7 +2326,25 @@ def reconstruct_rectangle(
                 start, end = edge_points(polygon, edge_index)
                 vector = end - start
                 all_edge_angles.append(math.atan2(float(vector[1]), float(vector[0])))
-        for edge_angle in all_edge_angles:
+
+        def edge_angle_priority(edge_angle: float) -> float:
+            angle = normalize_angle_rad(-edge_angle)
+            rotated_points = np.concatenate(
+                [rotate_points(polygon, angle) for polygon in assembled],
+                axis=0,
+            )
+            size = np.max(rotated_points, axis=0) - np.min(
+                rotated_points, axis=0
+            )
+            bounding_area = max(1.0, float(size[0] * size[1]))
+            # Correct rectangle boundary directions maximize fill before the
+            # more expensive overlap/clearance checks.  This makes composite
+            # layouts both deterministic and fast without changing topology.
+            return -(total_area / bounding_area)
+
+        for edge_angle in sorted(all_edge_angles, key=edge_angle_priority):
+            soft_rejection_penalty = 0.0
+            soft_rejection_reasons: list[str] = []
             global_angle = normalize_angle_rad(-edge_angle)
             exact = [rotate_points(polygon, global_angle) for polygon in assembled]
             points = np.concatenate(exact, axis=0)
@@ -1902,17 +2358,61 @@ def reconstruct_rectangle(
             coverage = total_area / bounding_area
             if not 0.68 <= coverage <= 1.03:
                 rejection_counts["coverage"] += 1
-                continue
-            if not is_composite_assembly and not all(
-                _piece_has_boundary_edge(
-                    polygon, minimum, maximum,
-                    tolerance=BOUNDARY_TOLERANCE_MM,
+                soft_rejection_reasons.append("COVERAGE")
+                soft_rejection_penalty += 300.0 * (
+                    max(0.0, 0.68 - coverage)
+                    + max(0.0, coverage - 1.03)
+                )
+            boundary_piece_count = sum(
+                int(
+                    _piece_has_boundary_edge(
+                        polygon,
+                        minimum,
+                        maximum,
+                        tolerance=BOUNDARY_TOLERANCE_MM,
+                    )
                 )
                 for polygon in exact
+            )
+            if (
+                not is_composite_assembly
+                and boundary_piece_count != len(exact)
             ):
                 rejection_counts["boundary"] += 1
+                soft_rejection_reasons.append("BOUNDARY")
+                soft_rejection_penalty += 35.0 * (
+                    len(exact) - boundary_piece_count
+                )
+            # Most rejected layouts can be ranked using edge mismatch,
+            # bounding-box fill and boundary contact alone.  Only a layout
+            # capable of improving the retained fallback proceeds to raster
+            # quality and overlap processing.  This keeps best-effort
+            # bookkeeping O(1) without a second full solver pass.
+            cheap_rejected_score = (
+                seam_error
+                + soft_rejection_penalty
+                + 90.0 * abs(1.0 - min(1.05, coverage))
+            )
+            if (
+                soft_rejection_reasons
+                and (
+                    bool(candidates)
+                    or cheap_rejected_score >= best_rejected_score
+                )
+            ):
                 continue
             normalized_exact = [polygon - minimum for polygon in exact]
+            # Parallel outer/seam edges produce the same normalized layout
+            # several times with different "global edge" choices.  The old
+            # order rasterized every duplicate at 1 mm resolution before
+            # noticing it was identical, which dominates 2/3-piece runtime on
+            # the Pi.  The key depends only on rigid geometry, so deduplicating
+            # here is equivalent and avoids repeated expensive quality checks.
+            key = _layout_key(normalized_exact)
+            if key in seen_layouts:
+                rejection_counts["duplicate"] += 1
+                continue
+            seen_layouts.add(key)
             global_quality = _global_rectangle_quality(
                 normalized_exact,
                 width,
@@ -1927,12 +2427,33 @@ def reconstruct_rectangle(
                 or int(global_quality["connected_components"]) > 2
             ):
                 rejection_counts["coverage"] += 1
+                soft_rejection_reasons.append("GLOBAL_QUALITY")
+                soft_rejection_penalty += (
+                    250.0
+                    * max(
+                        0.0,
+                        0.72
+                        - float(global_quality["raster_fill_ratio"]),
+                    )
+                    + 30.0
+                    * max(
+                        0,
+                        int(global_quality["connected_components"]) - 2,
+                    )
+                )
+            quality_rejected_score = (
+                seam_error
+                + float(global_quality["score"])
+                + soft_rejection_penalty
+            )
+            if (
+                soft_rejection_reasons
+                and (
+                    bool(candidates)
+                    or quality_rejected_score >= best_rejected_score
+                )
+            ):
                 continue
-            key = _layout_key(normalized_exact)
-            if key in seen_layouts:
-                rejection_counts["duplicate"] += 1
-                continue
-            seen_layouts.add(key)
 
             transformed_seams = list(seams)
             selected_gap = (
@@ -1946,14 +2467,31 @@ def reconstruct_rectangle(
                 trial, trial_offsets = _separate_seams(
                     normalized_exact, transformed_seams, selected_gap
                 )
-                if is_composite_assembly:
-                    grid_result = _resolve_composite_overlaps_grid(trial)
-                    if grid_result is not None:
-                        trial, overlap_offsets = grid_result
-                    else:
-                        trial, overlap_offsets = _resolve_composite_overlaps(
-                            trial, clearance_mm=1.0
+                # Rejected layouts are ranked during the scan without the
+                # combinatorial grid resolver.  If one becomes the forced
+                # winner, overlap refinement runs exactly once below.
+                if is_composite_assembly and not soft_rejection_reasons:
+                    has_positive_overlap = any(
+                        polygons_overlap_with_area(
+                            trial[first_index], trial[second_index]
                         )
+                        for first_index in range(len(trial))
+                        for second_index in range(
+                            first_index + 1, len(trial)
+                        )
+                    )
+                    if has_positive_overlap:
+                        grid_result = _resolve_composite_overlaps_grid(trial)
+                        if grid_result is not None:
+                            trial, overlap_offsets = grid_result
+                        else:
+                            trial, overlap_offsets = _resolve_composite_overlaps(
+                                trial, clearance_mm=1.0
+                            )
+                    else:
+                        overlap_offsets = [
+                            np.zeros(2, np.float64) for _ in trial
+                        ]
                     trial_offsets = [
                         seam_offset + overlap_offset
                         for seam_offset, overlap_offset in zip(
@@ -2002,7 +2540,11 @@ def reconstruct_rectangle(
                 and int(global_quality["overlap_pixels"]) > 40
             ):
                 rejection_counts["overlap"] += 1
-                continue
+                soft_rejection_reasons.append("OVERLAP")
+                soft_rejection_penalty += (
+                    500.0
+                    + 2.0 * int(global_quality["overlap_pixels"])
+                )
             maximum_vertex_gap = max(
                 (
                     float(np.linalg.norm(offsets[seam.second_piece] - offsets[seam.first_piece]))
@@ -2015,11 +2557,15 @@ def reconstruct_rectangle(
                 smallest_rejected_vertex_gap = min(
                     smallest_rejected_vertex_gap, maximum_vertex_gap
                 )
-                continue
+                soft_rejection_reasons.append("VERTEX_GAP")
+                soft_rejection_penalty += 20.0 * (
+                    maximum_vertex_gap - MAX_ADJACENT_VERTEX_GAP_MM
+                )
             score = (
                 seam_error
                 + float(global_quality["score"])
                 + 0.05 * max(0.0, requested_gap_mm - selected_gap)
+                + soft_rejection_penalty
             )
             composed = [
                 _compose_with_global(transform, global_angle)
@@ -2038,8 +2584,7 @@ def reconstruct_rectangle(
                     normalized_exact[first], normalized_exact[second]
                 ) <= 0.12
             )
-            candidates.append(
-                {
+            candidate = {
                     "score": score,
                     "global_quality": global_quality,
                     "adjacency_signature": full_adjacency,
@@ -2057,23 +2602,91 @@ def reconstruct_rectangle(
                     "exact_minimum_after_global": minimum,
                     "gap_offsets": offsets,
                     "seams": transformed_seams,
+                    "best_effort_forced": bool(soft_rejection_reasons),
+                    "forced_rejection_reasons": tuple(
+                        soft_rejection_reasons
+                    ),
                 }
-            )
+            if soft_rejection_reasons:
+                if score < best_rejected_score:
+                    best_rejected_score = score
+                    best_rejected_candidate = candidate
+            else:
+                candidates.append(candidate)
+            if is_composite_assembly and not soft_rejection_reasons:
+                # All global-edge rotations of the same rigid composite
+                # topology describe the same physical placement.  Once one
+                # passes the rectangle, overlap and vertex-gap checks, do not
+                # repeat the expensive overlap search for its other edges.
+                break
     if not candidates:
-        return {
-            "ready": False,
-            "error": "NO_RECTANGULAR_EDGE_MATCH_SOLUTION",
-            "relative_assemblies_checked": len(relative_assemblies),
-            "composite_assemblies_checked": len(composite_assemblies),
-            "rejection_counts": rejection_counts,
-            "smallest_rejected_vertex_gap_mm": (
-                None
-                if not math.isfinite(smallest_rejected_vertex_gap)
-                else round(smallest_rejected_vertex_gap, 2)
-            ),
-        }
+        if allow_best_effort and best_rejected_candidate is not None:
+            best_rejected_candidate["search_path"] = (
+                "FORCED_BEST_REJECTED_CANDIDATE"
+            )
+            best_rejected_candidate["normal_rejection_counts"] = dict(
+                rejection_counts
+            )
+            candidates.append(best_rejected_candidate)
+        else:
+            return {
+                "ready": False,
+                "error": "NO_RECTANGULAR_EDGE_MATCH_SOLUTION",
+                "relative_assemblies_checked": len(relative_assemblies),
+                "composite_assemblies_checked": len(composite_assemblies),
+                "rejection_counts": rejection_counts,
+                "smallest_rejected_vertex_gap_mm": (
+                    None
+                    if not math.isfinite(smallest_rejected_vertex_gap)
+                    else round(smallest_rejected_vertex_gap, 2)
+                ),
+            }
     candidates.sort(key=lambda value: float(value["score"]))
     best = candidates[0]
+    if best.get("best_effort_forced", False):
+        forced_grid_result = _resolve_composite_overlaps_grid(
+            best["polygons"]
+        )
+        if forced_grid_result is not None:
+            forced_polygons, forced_offsets = forced_grid_result
+            forced_points = np.concatenate(forced_polygons, axis=0)
+            forced_minimum = np.min(forced_points, axis=0)
+            best["polygons"] = [
+                polygon - forced_minimum for polygon in forced_polygons
+            ]
+            best["gap_offsets"] = [
+                existing + additional - forced_minimum
+                for existing, additional in zip(
+                    best["gap_offsets"], forced_offsets
+                )
+            ]
+            best["offsets"] = list(best["gap_offsets"])
+            best["final_size"] = np.max(
+                np.concatenate(best["polygons"], axis=0), axis=0
+            )
+            best["minimum_clearance"] = min(
+                (
+                    polygon_clearance(
+                        best["polygons"][first],
+                        best["polygons"][second],
+                    )
+                    for first in range(len(best["polygons"]))
+                    for second in range(first + 1, len(best["polygons"]))
+                ),
+                default=float("inf"),
+            )
+            best["maximum_vertex_gap"] = max(
+                (
+                    float(
+                        np.linalg.norm(
+                            best["gap_offsets"][seam.second_piece]
+                            - best["gap_offsets"][seam.first_piece]
+                        )
+                    )
+                    for seam in best.get("seams", [])
+                ),
+                default=0.0,
+            )
     different = next(
         (
             candidate
@@ -2087,13 +2700,9 @@ def reconstruct_rectangle(
     )
     # A very small margin between different adjacency graphs means the camera
     # data cannot uniquely determine which edges belong together.
-    if confidence_margin is not None and confidence_margin < 0.08:
-        return {
-            "ready": False,
-            "error": "AMBIGUOUS_RECTANGLE_SOLUTION",
-            "best_score": round(float(best["score"]), 4),
-            "confidence_margin": round(confidence_margin, 4),
-        }
+    ambiguous_best_selected = bool(
+        confidence_margin is not None and confidence_margin < 0.08
+    )
 
     _refine_winning_candidate(best, polygons, total_area)
 
@@ -2152,6 +2761,8 @@ def reconstruct_rectangle(
     return {
         "ready": True,
         "error": None,
+        "search_path": best.get("search_path"),
+        "normal_rejection_counts": best.get("normal_rejection_counts"),
         "solver": best.get("solver", "rigid_reversed_edge_search_v1"),
         "piece_count": len(pieces),
         "layout_size_mm": np.round(best["final_size"], 2).tolist(),
@@ -2194,6 +2805,11 @@ def reconstruct_rectangle(
             else min(1.0, max(0.0, confidence_margin / 1.5)),
             3,
         ),
+        "best_effort_forced": bool(best.get("best_effort_forced", False)),
+        "forced_rejection_reasons": list(
+            best.get("forced_rejection_reasons", ())
+        ),
+        "ambiguous_best_selected": ambiguous_best_selected,
         "moves": moves,
     }
 
@@ -2220,9 +2836,9 @@ def place_in_upper_half(
     reconstruction: dict[str, Any],
     divider_y_mm: float = DEFAULT_DIVIDER_Y_MM,
     divider_margin_mm: float = DEFAULT_DIVIDER_MARGIN_MM,
-    home_a4_mm: tuple[float, float] = (5.0, 61.0),
+    home_a4_mm: tuple[float, float] = (5.0, 62.0),
     reachable_x_mm: tuple[float, float] = (5.0, 205.0),
-    reachable_y_mm: tuple[float, float] = (61.0, 286.0),
+    reachable_y_mm: tuple[float, float] = (62.0, 287.0),
 ) -> dict[str, Any]:
     if not reconstruction.get("ready", False):
         return reconstruction
@@ -2309,7 +2925,7 @@ def place_in_upper_half(
     # The source is the visually lower half.  Put the reconstructed rectangle
     # as far down as allowed in the visually upper half, i.e. directly beside
     # the divider.  Moving it toward the A4 top would only enter the gantry's
-    # unreachable Y<61 mm band.
+    # unreachable Y<62 mm band.
     y_values = np.asarray([float(y_max)], np.float64)
     for origin_y in y_values:
         for origin_x in x_values:

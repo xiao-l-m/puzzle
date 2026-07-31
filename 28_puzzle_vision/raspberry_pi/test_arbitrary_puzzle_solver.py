@@ -120,6 +120,30 @@ class ArbitraryPuzzleSolverTests(unittest.TestCase):
         ]
         self.assert_valid_solution(solve_arbitrary_puzzle(pieces), 4)
 
+    def test_four_piece_three_segment_composite_seam(self) -> None:
+        """One triangle edge is shared by three consecutive piece edges."""
+        target = [
+            [[0, 0], [0, 30], [76, 18], [100, 0]],
+            [[20, 60], [100, 0], [100, 60]],
+            [[0, 40], [0, 30], [76, 18], [36, 48]],
+            [[0, 60], [0, 40], [36, 48], [20, 60]],
+        ]
+        pieces = [
+            observed_piece("W1", target[0], 31.0, (170.0, 220.0)),
+            observed_piece("W2", target[1], -18.0, (125.0, 235.0)),
+            observed_piece("W3", target[2], 47.0, (75.0, 220.0)),
+            observed_piece("W4", target[3], -36.0, (25.0, 220.0)),
+        ]
+        for piece in pieces:
+            piece["polygon_area_error_ratio"] = 0.0
+        result = solve_arbitrary_puzzle(pieces)
+        self.assert_valid_solution(result, 4)
+        width, height = result["target_rectangle_mm"]["size"]
+        # The motion target deliberately opens every internal seam by up to
+        # 1 mm; the accumulated outer box may therefore grow several mm.
+        self.assertAlmostEqual(max(width, height), 100.0, delta=7.0)
+        self.assertAlmostEqual(min(width, height), 60.0, delta=8.0)
+
     def test_live_four_piece_t_junction_reconstruction(self) -> None:
         """The July field set has two long seams split by centre pieces."""
         pieces = [
@@ -207,6 +231,31 @@ class ArbitraryPuzzleSolverTests(unittest.TestCase):
         }
         self.assertGreater(target_centers["W4"][1], target_centers["W2"][1])
 
+    def test_100_by_90_field_set_with_calibration_scale_error(self) -> None:
+        """A nominal 100x90 set must survive the observed 2..5% scale error."""
+        pieces = [
+            {"id": "W1", "center_mm": [125.05, 176.38], "pick_point_mm": [125.05, 176.38], "area_mm2": 2763.31, "polygon_area_error_ratio": 0.0007, "vertices_mm": [[63.03, 158.32], [165.42, 160.1], [165.41, 179.01], [147.7, 197.94], [134.79, 207.8]]},
+            {"id": "W2", "center_mm": [63.05, 216.85], "pick_point_mm": [63.05, 216.85], "area_mm2": 3985.84, "polygon_area_error_ratio": 0.0013, "vertices_mm": [[27.32, 171.76], [108.18, 203.54], [75.35, 254.55], [46.29, 262.22]]},
+            {"id": "W3", "center_mm": [162.66, 238.82], "pick_point_mm": [162.66, 238.82], "area_mm2": 2265.78, "polygon_area_error_ratio": 0.0018, "vertices_mm": [[205.17, 205.74], [194.86, 233.96], [158.86, 265.75], [110.9, 246.91]]},
+            {"id": "W4", "center_mm": [120.25, 266.6], "pick_point_mm": [120.25, 266.6], "area_mm2": 489.06, "polygon_area_error_ratio": 0.0006, "vertices_mm": [[106.09, 251.06], [148.59, 274.58], [106.09, 274.12]]},
+        ]
+        result = solve_arbitrary_puzzle(pieces, divider_y_mm=151.8)
+        self.assertTrue(result.get("ready"), result)
+        self.assertEqual(result.get("solver"), "outer_boundary_rectangle_pack_v1")
+        width, height = result["target_rectangle_mm"]["size"]
+        self.assertLessEqual(abs(max(width, height) - 100.0), 7.0, result)
+        self.assertLessEqual(abs(min(width, height) - 90.0), 6.0, result)
+        self.assertLessEqual(result["maximum_adjacent_vertex_gap_mm"], 20.0)
+        polygons = [
+            np.asarray(move["target_vertices_mm"], np.float64)
+            for move in result["moves"]
+        ]
+        for first in range(len(polygons)):
+            for second in range(first + 1, len(polygons)):
+                self.assertFalse(
+                    polygons_overlap_with_area(polygons[first], polygons[second])
+                )
+
     def test_visual_lower_pick_uses_direct_stage_y_and_is_reachable(self) -> None:
         piece = observed_piece(
             "W1", [[0, 0], [100, 0], [100, 60], [0, 60]], 0.0, (90.0, 200.0)
@@ -253,6 +302,23 @@ class ArbitraryPuzzleSolverTests(unittest.TestCase):
             "NO_RECTANGULAR_EDGE_MATCH_SOLUTION",
         )
 
+    def test_best_rejected_candidate_is_returned_when_quality_filters_all(self) -> None:
+        sparse = {
+            "id": "W1",
+            "vertices_mm": [[0, 0], [100, 0], [100, 20], [40, 20], [0, 60]],
+            "center_mm": [48, 20],
+            "pick_point_mm": [50, 10],
+            "polygon_area_error_ratio": 0.0,
+        }
+        result = reconstruct_rectangle([sparse])
+        self.assertTrue(result.get("ready"), result)
+        self.assertTrue(result.get("best_effort_forced"), result)
+        self.assertEqual(
+            result.get("search_path"),
+            "FORCED_BEST_REJECTED_CANDIDATE",
+        )
+        self.assertIn("COVERAGE", result.get("forced_rejection_reasons", []))
+
     def test_mode3_motion_plan_preserves_variable_count(self) -> None:
         pieces = [
             observed_piece(
@@ -279,10 +345,10 @@ class ArbitraryPuzzleSolverTests(unittest.TestCase):
             self.assertAlmostEqual(
                 move["place_controller_a4_mm"][1], move["place_a4_mm"][1]
             )
-            self.assertGreaterEqual(move["pick_controller_a4_mm"][1], 61.0)
-            self.assertLessEqual(move["pick_controller_a4_mm"][1], 286.0)
-            self.assertGreaterEqual(move["place_controller_a4_mm"][1], 61.0)
-            self.assertLessEqual(move["place_controller_a4_mm"][1], 286.0)
+            self.assertGreaterEqual(move["pick_controller_a4_mm"][1], 62.0)
+            self.assertLessEqual(move["pick_controller_a4_mm"][1], 287.0)
+            self.assertGreaterEqual(move["place_controller_a4_mm"][1], 62.0)
+            self.assertLessEqual(move["place_controller_a4_mm"][1], 287.0)
 
         corrected = build_task_plan(
             3,

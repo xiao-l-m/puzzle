@@ -36,4 +36,5 @@ if kill -0 "$pid" 2>/dev/null; then
     exit 1
 fi
 rm -f "$PID_FILE"
+rm -f "$APP_DIR/puzzle_vision.mode"
 echo "puzzle vision stopped: PID $pid"
